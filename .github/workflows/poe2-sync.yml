@@ -1,0 +1,38 @@
+名称: PoE2 价格同步
+
+开启:
+  schedule:
+    - cron: "*/20 * * * *"→ 每20分钟运行一次
+ 工作流调度:      # 也可手动触发一次，便于排查
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取出代码（main 分支）
+        uses: actions/checkout@v4
+
+      # 没有 setup-python / pip install 都不是漏了：ubuntu-latest 自带 Python 3.12，
+      # 而 app.py 只依赖标准库 + 项目内的 zhdict.py。
+
+      - name: 抓一轮价格
+        env:
+          POE2_LEAGUE: Forbidden Rites
+        run: python3 cloud_fetch.py
+
+      - name: 推送到 data 分支（单 commit 强推）
+        env:
+          GIT_AUTHOR_NAME: poe2-sync-bot
+          GIT_AUTHOR_EMAIL: bot@example.com
+          GIT_COMMITTER_NAME: poe2-sync-bot
+          GIT_COMMITTER_EMAIL: bot@example.com
+        run: |
+          set -e
+          git checkout --orphan data
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git add -f data.json
+          git commit -m "sync $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git push -f origin data
