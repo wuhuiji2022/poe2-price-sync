@@ -1,9 +1,9 @@
-名称: PoE2 价格同步
+ name: PoE2 价格同步
 
-开启:
+on:
   schedule:
-    - cron: "*/20 * * * *"→ 每20分钟运行一次
- 工作流调度:      # 也可手动触发一次，便于排查
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,11 +12,7 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: 取出代码（main 分支）
-        uses: actions/checkout@v4
-
-      # 没有 setup-python / pip install 都不是漏了：ubuntu-latest 自带 Python 3.12，
-      # 而 app.py 只依赖标准库 + 项目内的 zhdict.py。
+      - uses: actions/checkout@v4
 
       - name: 抓一轮价格
         env:
