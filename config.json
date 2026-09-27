@@ -1,0 +1,143 @@
+{
+  "league": "Forbidden Rites",
+  "auto_follow_latest_league": true,
+  "interval_minutes": 30,
+  "adaptive_poll": true,
+  "poll_min_seconds": 60,
+  "poll_max_seconds": 900,
+  "poll_backoff": 1.5,
+  "fallback_minutes": 90,
+  "poll_probe_types": [
+    "Currency",
+    "Essences"
+  ],
+  "port": 8712,
+  "host": "0.0.0.0",
+  "retention_days": 30,
+  "categories": [
+    {
+      "id": "Currency",
+      "label": "通货",
+      "enabled": true
+    },
+    {
+      "id": "Essences",
+      "label": "精髓",
+      "enabled": true
+    },
+    {
+      "id": "Delirium",
+      "label": "液态情感",
+      "enabled": true
+    },
+    {
+      "id": "Breach",
+      "label": "裂隙催化剂",
+      "enabled": true
+    },
+    {
+      "id": "Abyss",
+      "label": "深渊之骨",
+      "enabled": true
+    },
+    {
+      "id": "Fragments",
+      "label": "碎片",
+      "enabled": true
+    },
+    {
+      "id": "Runes",
+      "label": "符文",
+      "enabled": true
+    },
+    {
+      "id": "Ritual",
+      "label": "祭坛预兆",
+      "enabled": true
+    },
+    {
+      "id": "SoulCores",
+      "label": "灵魂核心",
+      "enabled": true
+    },
+    {
+      "id": "Idols",
+      "label": "神像",
+      "enabled": true
+    },
+    {
+      "id": "UncutGems",
+      "label": "未切割宝石",
+      "enabled": true
+    },
+    {
+      "id": "Expedition",
+      "label": "远征物品",
+      "enabled": true
+    },
+    {
+      "id": "LineageSupportGems",
+      "label": "血统辅助宝石",
+      "enabled": true
+    },
+    {
+      "id": "Verisium",
+      "label": "维里斯汞金",
+      "enabled": true
+    }
+  ],
+  "auto_discover_categories": true,
+  "price_source": "scout",
+  "auto_interval": true,
+  "spread_enabled": false,
+  "spread_top_n": 12,
+  "spread_request_gap": 8.0,
+  "trade_host": "https://www.pathofexile.com",
+  "spread_pairs_per_round": 3,
+  "spread_round_seconds": 600,
+  "spread_refs": [
+    "chaos"
+  ],
+  "spread_window_hours": 24,
+  "spread_rescan_minutes": 360,
+  "spread_display_limit": 20,
+  "spread_exclude": [
+    "aug",
+    "greater-orb-of-augmentation",
+    "perfect-orb-of-augmentation",
+    "transmute",
+    "greater-orb-of-transmutation",
+    "perfect-orb-of-transmutation",
+    "regal",
+    "greater-regal-orb",
+    "perfect-regal-orb",
+    "exalted",
+    "greater-exalted-orb",
+    "perfect-exalted-orb",
+    "chaos",
+    "greater-chaos-orb",
+    "perfect-chaos-orb",
+    "vaal",
+    "alch",
+    "divine",
+    "chance",
+    "annul",
+    "artificers",
+    "fracturing-orb",
+    "mirror",
+    "hinekoras-lock",
+    "cryptic-key"
+  ],
+  "arb_min_value": 0.01,
+  "arb_min_stock": 30,
+  "arb_min_orders": 10,
+  "arb_active_orders": 1000,
+  "arb_hide_cold": false,
+  "arb_max_cold_ratio": 0.4,
+  "arb_conf_samples": 8,
+  "icon_warm_per_round": 60,
+  "_cloud_sync_note": "cloud_sync_url 填 GitHub 仓库的 data.json 直链（推荐 jsDelivr：https://cdn.jsdelivr.net/gh/<用户名>/<仓库名>@data/data.json）。留空 = 不启用云端补数据，不影响本机抓取。",
+  "cloud_sync_url": "https://cdn.jsdelivr.net/gh/wuhuiji2022/poe2-price-sync@data/data.json",
+  "cloud_sync_interval_minutes": 30,
+  "name_zh_overrides": {}
+}
