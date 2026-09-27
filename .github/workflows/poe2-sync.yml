@@ -1,4 +1,4 @@
- name: PoE2 价格同步
+name: PoE2 价格同步
 
 on:
   schedule:
