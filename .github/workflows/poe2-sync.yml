@@ -1,9 +1,17 @@
 name: PoE2 价格同步
 
+# 本机只在程序开着的时候抓数据，电脑一关 24 小时窗口就空出一段，
+# 倒货榜的波动空间会因采样变少而失真。这里由云端按时补抓，
+# 只留最近 48 小时，本机启动时拉取缺失时段合并进自己的库。
 on:
   schedule:
+    # 20 分钟一轮（72 次/天）。为什么不再密：
+    #   免费账号 2000 分钟/月，单次 job 约 30~40 秒 → 20 分钟档约 1080~1440 分钟/月，安全；
+    #   15 分钟档约 1440~1920 分钟/月，贴着上限；10 分钟档必然超额。
+    # 另外源本身约 5 分钟刷新一次，本机在线时是 5 分钟一采（采样率 100%），
+    # 云端只负责补「本机离线」那段时间，20 分钟够用，不需要追平原的刷新频率。
     - cron: "*/20 * * * *"
-  workflow_dispatch:
+  workflow_dispatch:      # 手动也能点一次，方便排查
 
 permissions:
   contents: write
@@ -12,10 +20,42 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: 取出代码（main 分支）
+        uses: actions/checkout@v4
+
+      # ★★ 这一步绝对不能删，删了整个云端补数据就废了 ★★
+      # checkout 默认只取 main 分支，而 data.json 只存在于 data 分支上，
+      # 工作目录里根本没有它。少了这一步，cloud_fetch.py 的 load_existing()
+      # 每轮都读到空，于是从零开始写 → data.json 里永远只有「本轮」1 个时间点，
+      # 再被下面的 orphan 强推覆盖 → 48 小时历史从来没累积过。
+      # 2026-09-28 排查：ts 数组长度恒为 1，本机离线 8 小时一个点都补不上，就是这里。
+      - name: 取回上一轮的 data.json（在 data 分支上）
+        run: |
+          git fetch --depth=1 origin data 2>/dev/null || true
+          if git show FETCH_HEAD:data.json > _prev.json 2>/dev/null && [ -s _prev.json ]; then
+            mv _prev.json data.json
+            echo "已取回上一轮数据：$(( $(wc -c < data.json) / 1024 )) KB"
+          else
+            # git 那条路走不通时（远程 refspec 被限制等），退回直连取一次
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/data/data.json" -o _prev.json 2>/dev/null || true
+            if [ -s _prev.json ]; then
+              mv _prev.json data.json
+              echo "已取回上一轮数据（直连）：$(( $(wc -c < data.json) / 1024 )) KB"
+            else
+              rm -f _prev.json
+              echo "首次运行，没有历史数据，从空开始"
+            fi
+          fi
+
+      # ⚠️ 没有 setup-python、也没有 pip install，都不是漏了：
+      #   1. ubuntu-latest 镜像自带 Python 3.12，直接用 python3 即可；setup-python
+      #      那一步要花 15~20 秒，20 分钟一轮的话一个月白白烧掉 1000+ 分钟额度。
+      #   2. app.py 只依赖标准库（外加项目内的 zhdict.py），不需要装任何东西。
+      #      日后若引入第三方库，记得在这里补 requirements.txt 的安装步骤。
 
       - name: 抓一轮价格
         env:
+          # 赛季换了要改这里；本机 config.json 的 league 也要同步改
           POE2_LEAGUE: Forbidden Rites
         run: python3 cloud_fetch.py
 
@@ -27,8 +67,20 @@ jobs:
           GIT_COMMITTER_EMAIL: bot@example.com
         run: |
           set -e
+          # ⚠️ 为什么必须 orphan + 强推：
+          #    data.json 约 2MB，如果正常 commit，每天 48 次就是 ~100MB/天，
+          #    一个月仓库能涨到几个 GB。orphan 分支每次只有一个 commit，
+          #    仓库体积恒定在 2MB 左右。代码留在 main，数据单独走 data 分支。
           git checkout --orphan data
           git rm -rf --cached . >/dev/null 2>&1 || true
           git add -f data.json
           git commit -m "sync $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push -f origin data
+
+      # jsDelivr 对分支文件的缓存最长 12 小时，客户端加 ?t=xxx 也绕不过去
+      # （试过三次，三次都返回同一份旧数据）。不主动清的话，本机拉到的
+      # 永远是几小时前的 data.json，白白浪费这一轮抓取。
+      - name: 刷新 jsDelivr 缓存
+        run: |
+          curl -fsS "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/data.json" \
+            || echo "  · 缓存刷新失败（不影响数据本身，本机有直连源兜底）"
