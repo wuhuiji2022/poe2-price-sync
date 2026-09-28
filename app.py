@@ -19,6 +19,7 @@ SQLite，并通过本地网页提供「搜索 + 图表」看板。
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -43,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.3"
+VERSION = "1.27.4"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -178,6 +179,10 @@ DEFAULT_CONFIG: dict = {
     # 官方静态数据里没有中文条目的通货，在这里手动补中文名（键写通货 id）。
     # 赛季更新出了新物品、官方还没给中文时，直接往这里加一行就能顶上，优先级高于内置兜底表。
     "name_zh_overrides": {},
+    # 是否显示命令行黑框。程序是不带控制台打包的（双击只有一个程序窗口），
+    # 想看实时日志就把这里改成 true，再来一次就会先弹出黑框。
+    # 无论这里是 true 还是 false，日志都会写进 data/logs/当天日期.log。
+    "console": False,
 }
 
 
@@ -397,11 +402,16 @@ def web_dir() -> Path:
 DATA_DIR = app_dir() / "data"
 ICON_DIR = DATA_DIR / "icons"
 DB_PATH = DATA_DIR / "tracker.db"
+# 日志文件目录。程序不带控制台跑的时候，这里是唯一能追溯「刚才到底发生了什么」的地方，
+# 所以 log() 一律同时写一份到这里（按天一个文件）。
+LOG_DIR = DATA_DIR / "logs"
+LOG_KEEP_DAYS = 7
 
 
 def setup_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ICON_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     # 暗金中文化词典：由 build_zh.py 生成，缺失时页面回落英文，不影响其它功能
     ZH.load(DATA_DIR / "unique_zh.json")
 
@@ -2837,12 +2847,55 @@ def fmt_duration(seconds: int) -> str:
     return f"{minutes} 分钟" if rest == 0 else f"{minutes} 分 {rest} 秒"
 
 
+_LOG_LOCK = threading.Lock()
+_LOGS_PRUNED = False
+
+
+def _log_file() -> Path:
+    return LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.log"
+
+
+def _write_log(line: str) -> None:
+    """把一行日志追加到当天日志文件。
+
+    ⚠️ 控制台可以被关掉（也可以压根不分配），但排障不能没有线索，
+    所以这里任何异常都吞掉——写日志失败绝不能反过来把主流程搞挂。
+    """
+    global _LOGS_PRUNED
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with _LOG_LOCK:
+            with open(_log_file(), "a", encoding="utf-8") as fp:
+                fp.write(line + "\n")
+        if not _LOGS_PRUNED:
+            _LOGS_PRUNED = True
+            _prune_logs()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _prune_logs() -> None:
+    """只保留最近 LOG_KEEP_DAYS 天的日志，别让它跟着程序一起越攒越大。"""
+    try:
+        files = sorted(LOG_DIR.glob("*.log"))
+        for old in files[:-LOG_KEEP_DAYS]:
+            try:
+                old.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def log(message: str) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{stamp}] {message}"
     try:
-        print(f"[{stamp}] {message}", flush=True)
+        print(line, flush=True)
     except UnicodeEncodeError:  # 控制台编码异常时降级
-        print(f"[{stamp}] {message.encode('ascii', 'replace').decode()}", flush=True)
+        line = f"[{stamp}] {message.encode('ascii', 'replace').decode()}"
+        print(line, flush=True)
+    _write_log(line)
 
 
 def planned_interval_seconds() -> int:
@@ -4974,8 +5027,9 @@ def window_size() -> tuple[int, int, int, int]:
 def hide_console() -> None:
     """隐藏本进程的控制台黑框（--hide-console）。
 
-    双击 exe 时那块黑框很碍眼，但日志又是排障的唯一线索，所以做成可选：
-    默认保留，想要「纯窗口」的样子就加这个参数。
+    ⚠️ v1.27.4 起 exe 是「不带控制台」打包的，平时压根没有黑框，
+    这个函数只在「已经开了一个（--console / config console: true / 从 cmd 启动）」
+    又想临时收起来的时候才有用，保留它是为了不破坏老用法。
     """
     try:
         import ctypes
@@ -4985,6 +5039,60 @@ def hide_console() -> None:
             ctypes.windll.user32.ShowWindow(hwnd, 0)      # 0 = SW_HIDE
     except Exception:                                      # noqa: BLE001
         pass
+
+
+def has_console() -> bool:
+    """当前进程是否已经挂着一个控制台窗口。"""
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:                                      # noqa: BLE001
+        return False
+
+
+def ensure_console() -> bool:
+    """需要看实时输出时，现场给自己开一个控制台。
+
+    exe 是用 console=False 打包的（双击只有程序窗口，不闪黑框），
+    代价是进程根本没有 stdout，日志一股脑全丢。两条路都想要，就只能在
+    真正需要的时候把控制台「补」回来：
+
+      · 纯服务模式（--no-window，局域网给别的设备访问）——没黑框就没法 Ctrl+C；
+      · config.json 里 console 改成 true —— 排障时看实时日志；
+      · 命令行加 --console —— 同上，临时看一眼。
+
+    AllocConsole 之后标准句柄（0/1/2）指向的还是「没有」，必须自己
+    把 CONIN$/CONOUT$ dup2 过去，再重建 sys.stdin/stdout/stderr，
+    否则 print 依旧什么都不输出。
+    """
+    if has_console():
+        return False                       # 已经有了（从 cmd 启动 / 控制台版打包）
+    try:
+        import ctypes
+
+        if not ctypes.windll.kernel32.AllocConsole():
+            return False
+    except Exception:                      # noqa: BLE001
+        return False
+    try:
+        # CONOUT$/CONIN$ 是 Windows 控制台的设备名，os.open 拿到 fd 再 dup2 到标准句柄
+        out_fd = os.open("CONOUT$", os.O_RDWR | os.O_BINARY)
+        os.dup2(out_fd, 1)
+        os.dup2(out_fd, 2)
+        in_fd = os.open("CONIN$", os.O_RDONLY | os.O_BINARY)
+        os.dup2(in_fd, 0)
+        sys.stdout = io.TextIOWrapper(os.fdopen(1, "wb", closefd=False),
+                                      encoding="utf-8", errors="replace",
+                                      line_buffering=True)
+        sys.stderr = io.TextIOWrapper(os.fdopen(2, "wb", closefd=False),
+                                      encoding="utf-8", errors="replace",
+                                      line_buffering=True)
+        sys.stdin = io.TextIOWrapper(os.fdopen(0, "rb", closefd=False),
+                                     encoding="utf-8", errors="replace")
+        return True
+    except Exception:                      # noqa: BLE001
+        return False
 
 
 def alert(message: str) -> None:
@@ -5061,15 +5169,34 @@ def port_in_use(port: int) -> bool:
 
 
 def main() -> None:
+    # ⚠️ 决定「要不要黑框」必须排在任何 print 之前：
+    #    exe 是不带控制台打包的，晚一步开就丢掉了这之前的全部输出
+    #    （端口占用那段提示最要命——用户会看到一个弹框，却不知道前因后果）。
+    #    需要黑框的三种情况：配置里打开、命令行加 --console、
+    #    纯服务模式（--no-window，没有窗口可关，得留个能 Ctrl+C 的地方）。
+    wants_console = (
+        bool(CONFIG.get("console"))
+        or "--console" in sys.argv
+        or "--no-window" in sys.argv
+        or "--no-browser" in sys.argv
+        or bool(os.environ.get("POE2_NO_BROWSER"))
+    )
+    if wants_console:
+        ensure_console()
+    # 记一笔控制台状态。这是「到底有没有黑框」唯一可靠的判据——
+    # 外部没法判断：Win10 之后控制台窗口归 conhost.exe 所有，不属于本进程，
+    # 按 PID 枚举顶层窗口永远找不到它（踩过：据此写出的用例 A 假通过、B 假失败）。
+    log(f"控制台：{'已显示' if has_console() else '未显示（正常，日志见 ' + str(LOG_DIR) + '）'}")
     setup_dirs()
     init_db()
 
     if port_in_use(PORT):
-        print("=" * 58)
-        print(f" 端口 {PORT} 上已经有一个本程序在运行了。")
-        print(" 请先关闭原来的那个窗口，再重新启动——")
-        print(" 否则新旧两份会抢同一个端口，看到的可能还是旧版本。")
-        print("=" * 58)
+        # 用 log 而不是 print：不只写屏幕，也要落进当天日志文件
+        log("=" * 58)
+        log(f" 端口 {PORT} 上已经有一个本程序在运行了。")
+        log(" 请先关闭原来的那个窗口，再重新启动——")
+        log(" 否则新旧两份会抢同一个端口，看到的可能还是旧版本。")
+        log("=" * 58)
         # 控制台可能被 --hide-console 隐藏了，光靠 print 用户什么也看不到
         alert(f"端口 {PORT} 上已经有一个本程序在运行了。\n\n"
               f"请先关闭原来那个窗口，再重新启动——\n"
@@ -5080,31 +5207,33 @@ def main() -> None:
     boot_worker = FetchWorker()
     boot_worker.ensure_item_catalog()
 
-    print("=" * 58)
-    print(f" PoE2 通货汇率追踪器 v{VERSION}")
+    # 一律走 log()：屏幕上看不看得见无所谓，但必须落进当天日志文件
+    log("=" * 58)
+    log(f" PoE2 通货汇率追踪器 v{VERSION}")
     if ADAPTIVE_POLL:
-        print(
+        log(
             f" 联盟：{LEAGUE}    更新跟踪：自适应探测 "
             f"{POLL_MIN_SECONDS}~{POLL_MAX_SECONDS} 秒（源站一更新就抓，兜底 {POLL_FALLBACK_SECONDS // 60} 分钟）"
         )
     else:
-        print(f" 联盟：{LEAGUE}    抓取间隔：固定 {INTERVAL_SECONDS // 60} 分钟")
-    print(f" 数据：{DB_PATH}")
-    print(f" 配置：{config_path()}（可直接编辑，改完重启生效）")
-    print(f" 类别：{len(CATEGORIES)} 个")
+        log(f" 联盟：{LEAGUE}    抓取间隔：固定 {INTERVAL_SECONDS // 60} 分钟")
+    log(f" 数据：{DB_PATH}")
+    log(f" 配置：{config_path()}（可直接编辑，改完重启生效）")
+    log(f" 类别：{len(CATEGORIES)} 个")
+    log(f" 日志：{LOG_DIR}")
     if SPREAD_ENABLED:
-        print(
+        log(
             f" 买卖挂单：每 {SPREAD_ROUND_SECONDS // 60} 分钟扫 {SPREAD_PAIRS_PER_ROUND} 个通货"
             f"（基准 {'/'.join(SPREAD_REFS)}，间隔 {SPREAD_REQUEST_GAP:.0f}s，"
             f"榜单保留 {SPREAD_WINDOW_HOURS} 小时）"
         )
-        print(
+        log(
             f" 差价榜：排除 {len(excluded_currency_ids())} 种基础通货，"
             f"只显示点差前 {SPREAD_DISPLAY_LIMIT} 名"
         )
     else:
-        print(" 买卖差价榜：已停用（不再请求官方交易接口，避免官方限流）")
-    print("=" * 58)
+        log(" 买卖差价榜：已停用（不再请求官方交易接口，避免官方限流）")
+    log("=" * 58)
 
     load_leagues()
 
@@ -5228,4 +5357,20 @@ def bind_server() -> tuple[ThreadingHTTPServer, int]:
 
 
 if __name__ == "__main__":
-    main()
+    # ⚠️ 没有控制台之后，未捕获异常的表现是「双击了一下，什么都没发生」——
+    #    用户既看不到窗口也看不到报错，只会以为程序坏了。所以这里必须兜住：
+    #    写日志 + 弹系统消息框，两样都不依赖控制台。
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:                                # noqa: BLE001
+        import traceback
+
+        try:
+            log(f"程序异常退出：{exc}")
+            log(traceback.format_exc())
+        except Exception:                                   # noqa: BLE001
+            pass
+        alert(f"程序出错了，已停止运行：\n\n{exc}\n\n"
+              f"详细信息已写入 data\\logs 目录下当天的日志文件。")
