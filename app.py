@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.4"
+VERSION = "1.27.5"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -159,6 +159,10 @@ DEFAULT_CONFIG: dict = {
     # 超过这个秒数没刷新就判定陈旧：取价整体改用 poe2scout，
     # 库存/挂单也让 scout 接管（doe 那份连兜底都不再用）。标称 30 分钟刷一次。
     "doe_stale_seconds": 5400,   # 90 分钟
+    # 第二道「僵住」判据：价格指纹连续这么久完全没变，就当 doe 在返回僵数据
+    # （2026-09-28 实测：时间戳每 15 分钟在动，价格却 7 小时不动，
+    #   只比时间戳的检测抓不到这种情况）。超时后本轮回退 poe2scout。
+    "doe_frozen_seconds": 2700,  # 45 分钟
     "spread_refs": ["chaos"],    # 自动扫描用哪些基准货币（与页面差价榜默认基准保持一致）
     "spread_window_hours": 24,   # 榜单展示窗口：多久之内扫到的挂单仍然展示
     "spread_rescan_minutes": 360, # 同一个通货隔多久才重新扫一次（配额有限，别调太小）
@@ -1101,6 +1105,12 @@ DOE_INTERVAL_SECONDS = 30 * 60   # 实测几分钟到二十分钟刷一次，取
 DOE_STALE_SECONDS = _clamp_int(
     CONFIG.get("doe_stale_seconds", 90 * 60), 90 * 60, 10 * 60, 24 * 3600
 )
+# 「价格指纹」连续不变的容忍时长：超过它就判定 doe 在返回僵数据。
+# 只在 doe 真的僵住时才生效（会改用 scout 价），正常行情下完全不触发，
+# 所以宁可设短一点早发现，也别让一份 7 小时前的复印件被当成实时价。
+DOE_FROZEN_SECONDS = _clamp_int(
+    CONFIG.get("doe_frozen_seconds", 45 * 60), 45 * 60, 10 * 60, 24 * 3600
+)
 
 _DOE_LOCK = threading.RLock()
 _DOE_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
@@ -1126,6 +1136,64 @@ def doe_stale(league: str) -> tuple[bool, int]:
         return True, 0
     age = int(time.time()) - ts
     return age > DOE_STALE_SECONDS, max(age, 0)
+
+
+# --------------------------------------------------------------------------
+# 「僵住」的第二道判据：价格指纹
+#
+# ⚠️ 2026-09-28 实测踩出来的：doe 抽风时会返回**时间戳在动、价格不动**的数据——
+#    fetched_at 每 15 分钟照常往前走，神圣石却 7 小时一个小数位都没变
+#    （15:27 到 22:06 共 54 个快照全是 482.9223…），期间 629 项数据纹丝不动。
+#    上面 doe_stale() 只看时间戳，这种情况永远判不出"僵"，
+#    程序就一直把这份复印件当新数据用。
+#
+# 教训：**数据源自报的时间戳不可信，要判断它是否僵住只能看数据本身变没变。**
+# 所以这里对每次拿到的价格算一个指纹，记住"这份指纹第一次是什么时候见到的"；
+# 只要指纹长时间不变，不管 fetched_at 多新鲜，都判僵住并回退 scout。
+# --------------------------------------------------------------------------
+_DOE_FP: dict[str, tuple[str, float]] = {}   # 联盟 -> (价格指纹, 首次见到该指纹的时刻)
+_DOE_FP_LOCK = threading.Lock()
+
+
+def _doe_fingerprint(flat: dict[str, dict]) -> str:
+    """对一批价格算指纹（只看价格，不看时间戳）。"""
+    try:
+        import hashlib
+
+        digest = hashlib.sha1()
+        for key in sorted(flat):
+            digest.update(f"{key}:{flat[key].get('price')!r};".encode("utf-8"))
+        return digest.hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def doe_note_prices(league: str, flat: dict[str, dict]) -> None:
+    """每次真正取到 doe 数据后记一笔指纹（价格一变就重置计时）。"""
+    fp = _doe_fingerprint(flat)
+    if not fp or not flat:
+        return
+    now = time.time()
+    with _DOE_FP_LOCK:
+        prev = _DOE_FP.get(league)
+        if prev is None or prev[0] != fp:
+            _DOE_FP[league] = (fp, now)
+
+
+def doe_frozen(league: str) -> tuple[bool, int]:
+    """dadsofexile 是不是「价格僵住了」：返回 (是否僵住, 已僵多久/秒)。
+
+    与 doe_stale() 互补：那个看时间戳新旧，这个看**价格本身**有没有变。
+    两者任一成立都应回退 scout —— 只有时间戳在动、价格不动这种情况，
+    光看时间戳是抓不到的。
+    """
+    with _DOE_FP_LOCK:
+        entry = _DOE_FP.get(league)
+    if not entry:
+        return False, 0
+    _fp, first_seen = entry
+    held = int(time.time() - first_seen)
+    return held >= DOE_FROZEN_SECONDS, max(held, 0)
 
 
 def pick_ask_bid(
@@ -1256,6 +1324,8 @@ def doe_prices(league: str, *, force: bool = False) -> dict[str, dict]:
         _DOE_CACHE[league] = (now, flat)
         if fetched:
             _DOE_SOURCE[league] = fetched
+    # 记下这批价格的指纹：下次比对就知道 doe 到底有没有真的刷新过
+    doe_note_prices(league, flat)
     return {k: dict(v) for k, v in flat.items()}
 
 
@@ -1999,9 +2069,18 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     # 僵住检测：它是个人小站，抽风时会一直返回同一份不动的数据。
     # 数据本身看着正常，只有 fetched_at 会暴露问题——一旦超时就整体回退 scout。
     stale, stale_age = doe_stale(league) if doe else (True, 0)
+    # ⚠️ 两道判据都要查，缺一不可：
+    #   stale  = 时间戳太旧（小站干脆不刷新了）
+    #   frozen = 时间戳还在动、但价格长时间一个不变（2026-09-28 实测踩到的那种）
+    frozen, frozen_age = doe_frozen(league) if doe else (False, 0)
+    if frozen and use_doe_base:
+        log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过"
+            f"（时间戳还在动，判定为僵数据），本轮改用 poe2scout")
+        use_doe_base = False
     if stale and use_doe_base:
         log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 poe2scout")
         use_doe_base = False
+    stale = stale or frozen
 
     # 挂出量 / 求购量改用 poe2scout 的「全交易所交易对快照」，doe 只做兜底。
     # ⚠️ 旧口径只查「对崇高石」那一个交易对、且只取自己那一侧，
@@ -2892,10 +2971,18 @@ def log(message: str) -> None:
     line = f"[{stamp}] {message}"
     try:
         print(line, flush=True)
-    except UnicodeEncodeError:  # 控制台编码异常时降级
-        line = f"[{stamp}] {message.encode('ascii', 'replace').decode()}"
-        print(line, flush=True)
-    _write_log(line)
+    except UnicodeEncodeError:
+        # ⚠️ 只降级「打印」，绝不能顺手把要落盘的那一行也改成 ASCII 版——
+        #    以前这里是 `line = ...ascii...` 然后照旧 _write_log(line)，
+        #    结果日志里凡是带中文的行全变成 "? ??? 642 ????14 ????"，
+        #    而没有控制台时日志文件是唯一的排障线索，等于自断一臂。
+        #    （不带控制台打包后 print 更容易踩到编码问题，所以这条必须守住。）
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+    _write_log(line)  # 永远写原始的、带中文的那一行
 
 
 def planned_interval_seconds() -> int:
