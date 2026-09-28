@@ -43,7 +43,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.1"
+VERSION = "1.27.2"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -2706,13 +2706,18 @@ def sync_from_cloud() -> dict:
     for idx in targets:
         ts = int(stamps[idx])
         for cid, item in items.items():
-            exalted = (item.get("e") or [None] * (idx + 1))[idx]
-            if exalted is None:          # 该时间点没价格，跳过
-                continue
-
+            # ⚠️ 别直接 `item["e"][idx]`：云端那份是 Actions 一轮轮推出来的，
+            #    并发推送 / 漏跑 / 中途换 app.py 都会让个别通货的数组比时间轴短
+            #    （2026-09-28 实测 data.json 里 650 个通货长度 3、2 个长度 1）。
+            #    直接取下标会 IndexError，而外层线程只打一行日志——
+            #    表现就是「云端补数据看着在跑，其实一轮都没补上」。
             def pick(key: str) -> object:
                 arr = item.get(key) or []
                 return arr[idx] if idx < len(arr) else None
+
+            exalted = pick("e")
+            if exalted is None:          # 该时间点没价格，跳过
+                continue
 
             records.append(
                 (

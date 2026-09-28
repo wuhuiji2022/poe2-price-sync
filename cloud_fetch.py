@@ -38,12 +38,36 @@ LEAGUE = os.environ.get("POE2_LEAGUE") or "Forbidden Rites"
 FIELDS = ("d", "e", "c", "o", "s")
 
 
+def normalize(data: dict) -> int:
+    """把每个通货的数组强制对齐到时间轴长度。返回修过的数组条数。
+
+    ⚠️ 为什么会错位：data.json 是 Actions 一轮轮追加出来的，上一轮可能用的还是
+    旧版 app.py、可能跑到一半失败、也可能两次推送撞车——都会留下个别通货的
+    数组比 ts 短（2026-09-28 实测：650 个通货长度 3，另有 2 个长度 1）。
+    不修的话客户端按 ts 下标取值直接 IndexError，一整轮补数据白跑。
+    短了补 null，长了截断（多出来的没有对应时间点，留着也是错位）。
+    """
+    n = len(data.get("ts") or [])
+    fixed = 0
+    for item in (data.get("items") or {}).values():
+        for key in FIELDS:
+            arr = item.get(key) or []
+            if len(arr) == n:
+                continue
+            item[key] = (list(arr) + [None] * n)[:n]
+            fixed += 1
+    return fixed
+
+
 def load_existing() -> dict:
     """读上一轮留下的 data.json；没有就从空架子开始。"""
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             if isinstance(data.get("ts"), list) and isinstance(data.get("items"), dict):
+                fixed = normalize(data)
+                if fixed:
+                    print(f"  · 上一轮有 {fixed} 条数组与时间轴错位，已对齐")
                 return data
         except (ValueError, OSError) as exc:
             print(f"  · 既有 data.json 读不出来（{exc}），重新开始")
@@ -130,6 +154,7 @@ def main() -> int:
     data = load_existing()
     written = append_snapshot(data, rows)
     dropped = prune(data)
+    normalize(data)          # 写盘前再兜一次，保证落盘的数组一定与 ts 等长
     data["v"] = 1
     data["generated"] = int(ts)
     data["league"] = LEAGUE
