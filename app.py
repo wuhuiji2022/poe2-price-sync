@@ -25,6 +25,7 @@ import os
 import re
 import socket
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
@@ -42,7 +43,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.26.0"
+VERSION = "1.27.1"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -484,6 +485,25 @@ CLOUD_SYNC_INTERVAL = _clamp_int(
     CONFIG.get("cloud_sync_interval_minutes", 30), 30, 5, 720) * 60
 CLOUD_SYNC_TIMEOUT = 20
 
+# jsDelivr 缓存的兜底源。jsDelivr 对「分支上的文件」最长缓存 12 小时：
+# 实测同一时刻 jsDelivr 给的是 8.8 小时前的旧版，而仓库里早就是新版了；
+# 加 ?t=<时间戳> 也绕不过（试过三次，三次都返回同一份旧数据）。
+# 于是从 jsDelivr 链接反推出 raw 链接，发现 CDN 那份过期就换直连再取一次。
+# 注意顺序不能倒：raw.githubusercontent 在国内经常被墙，jsDelivr 才是主源。
+CLOUD_SYNC_URL_RAW = ""
+_CDN_MATCH = re.match(
+    r"https?://cdn\.jsdelivr\.net/gh/([^/]+)/([^@]+)@([^/]+)/(.+)$", CLOUD_SYNC_URL
+)
+if _CDN_MATCH:
+    _user, _repo, _ref, _path = _CDN_MATCH.groups()
+    CLOUD_SYNC_URL_RAW = f"https://raw.githubusercontent.com/{_user}/{_repo}/{_ref}/{_path}"
+
+# 云端那份超过多少小时就算「缓存过期」，值得换源重试。
+# 为什么是 2 小时而不是更短：GitHub 的 cron 是尽力而为，忙时会漏跑，
+# 实测出现过 3 小时才跑一次的情况——那是云端真的没抓，不是 CDN 缓存旧。
+# 阈值卡太紧就会每次同步都白跑一次直连请求，白等一个超时。
+CLOUD_STALE_HOURS = 2.0
+
 # 扫描哪些基准货币。页面差价榜默认看混沌石，所以默认只扫混沌石：
 # 官方接口配额极其有限，扫得越杂、每个基准铺满的速度就越慢。
 _SPREAD_REFS_RAW = CONFIG.get("spread_refs") or ["chaos"]
@@ -592,6 +612,20 @@ def zh_display_name(currency_id: str, meta) -> str:
 
 # ------------------------------------------------------------------ 网络请求
 
+# Windows 上 urlopen 会先做一次系统代理自动探测（WPAD）：读注册表里的
+# Internet Settings 再去发现代理，探测超时后才回落直连，之后才有缓存。
+# 实测第一个类别 34.19 秒、后面每个只要 2.7 秒——差的正是这一段，
+# 这也是「每次打开程序都要等半天」的真凶（不是带宽、不是数据量）。
+# 云端同步早就用 ProxyHandler({}) 绕开了（见 sync_from_cloud），主抓取路径漏了。
+# ⚠️ 如果你确实在公司代理后面上网、必须走代理才能出去，
+#    把 config.json 里的 bypass_system_proxy 改成 false 即可回落系统代理。
+BYPASS_SYSTEM_PROXY = bool(CONFIG.get("bypass_system_proxy", True))
+_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}) if BYPASS_SYSTEM_PROXY
+    else urllib.request.ProxyHandler()
+)
+
+
 def http_get(url: str, *, timeout: int = 30, retries: int = 3) -> bytes:
     """带重试的 GET，失败返回最后一次异常。"""
     last: Exception | None = None
@@ -600,7 +634,7 @@ def http_get(url: str, *, timeout: int = 30, retries: int = 3) -> bytes:
             request = urllib.request.Request(
                 url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}
             )
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _HTTP_OPENER.open(request, timeout=timeout) as response:
                 return response.read()
         except Exception as exc:  # noqa: BLE001 - 网络层统一兜底
             last = exc
@@ -683,7 +717,14 @@ SCOUT_CATEGORIES = (
 def scout_currency_prices(league: str, *, force: bool = False) -> dict[str, float]:
     """取「1 单位通货 = 多少崇高石」，失败返回空字典（调用方按 ninja 结果兜底）。
 
-    结果按联盟缓存 10 分钟：一轮快照要抓十几个类别，没必要每个类别都去打一次 scout。
+    结果按联盟缓存 30 分钟。⚠️ 这里踩过两个性能坑（2026-09-28），改之前先看懂：
+
+    1. **必须单飞**。原来是「查缓存 → 释放锁 → 去抓」，并发抓 14 个类别时
+       头 6 个线程会同时发现缓存是冷的，于是同一份**全联盟**数据被重复抓 6 遍，
+       光这一项就让首轮卡 20 秒。现在整个抓取过程都在锁内完成，
+       后到的线程等锁时缓存已经热了，直接拿走。
+    2. **分页要并发**。17 个 scout 类别 + 逐页串行＝十几个请求排队，实测 13.75 秒；
+       按类别并发（分页仍在各类别内部串行）后约 3 秒。
     """
     now = time.time()
     with _SCOUT_LOCK:
@@ -691,80 +732,96 @@ def scout_currency_prices(league: str, *, force: bool = False) -> dict[str, floa
         if cached and not force and now - cached[0] < SCOUT_TTL_SECONDS:
             return dict(cached[1])
 
-    league_part = urllib.parse.quote(league)
-    prices: dict[str, float] = {}
-    quantities: dict[str, float] = {}
-    item_ids: dict[str, int] = {}
-    # 这里只记录源数据的更新时间；更新间隔不在这里推断（见 scout_probe_interval）
-    source_ts = 0.0
-    for category in SCOUT_CATEGORIES:
-        page = 1
-        while page <= 20:
-            url = (
-                f"{SCOUT_API}/{SCOUT_REALM}/Leagues/{league_part}"
-                f"/Currencies/ByCategory?category={category}&perPage=100&page={page}"
-            )
-            try:
-                payload = http_json(url, retries=2)
-            except Exception:  # noqa: BLE001 - 单个类别失败不影响其它类别
-                break
-            items = payload.get("Items") or []
-            for item in items:
-                api_id = item.get("ApiId")
-                price = item.get("CurrentPrice")
-                if not api_id:
-                    continue
-                try:
-                    raw_id = int(item.get("ItemId"))
-                except (TypeError, ValueError):
-                    raw_id = 0
-                if raw_id:
-                    item_ids[str(api_id)] = raw_id
+        league_part = urllib.parse.quote(league)
 
-                # 注意 PriceLogs 里偶尔夹 null，不能直接 .get
-                # 这里只取更新时间；间隔不从这里推断——
-                # ByCategory 的 PriceLogs 是每日一点（24h），但 CurrentPrice 实际 6 小时就变了，
-                # 用它算间隔会得到 24 小时，把抓取节奏拖得过长。间隔交给 scout_probe_interval。
-                for entry in (item.get("PriceLogs") or []):
-                    if not isinstance(entry, dict):
+        def fetch_one(
+            category: str,
+        ) -> tuple[dict[str, float], dict[str, float], dict[str, int], float]:
+            """抓一个 scout 类别的全部页，返回 (价格, 库存, 数字id, 源更新时间)。"""
+            sub_prices: dict[str, float] = {}
+            sub_qty: dict[str, float] = {}
+            sub_ids: dict[str, int] = {}
+            sub_ts = 0.0
+            page = 1
+            while page <= 20:
+                url = (
+                    f"{SCOUT_API}/{SCOUT_REALM}/Leagues/{league_part}"
+                    f"/Currencies/ByCategory?category={category}&perPage=100&page={page}"
+                )
+                try:
+                    payload = http_json(url, retries=2)
+                except Exception:  # noqa: BLE001 - 单个类别失败不影响其它类别
+                    break
+                items = payload.get("Items") or []
+                for item in items:
+                    api_id = item.get("ApiId")
+                    price = item.get("CurrentPrice")
+                    if not api_id:
                         continue
-                    stamp = _parse_scout_time(entry.get("Time"))
-                    if stamp > 0:
-                        source_ts = max(source_ts, stamp)
+                    try:
+                        raw_id = int(item.get("ItemId"))
+                    except (TypeError, ValueError):
+                        raw_id = 0
+                    if raw_id:
+                        sub_ids[str(api_id)] = raw_id
 
-                if price is None:
-                    continue
-                try:
-                    value = float(price)
-                except (TypeError, ValueError):
-                    continue
-                if value > 0:
-                    prices[str(api_id)] = value
-                # 顺手记下库存：倒货榜的「库存」列改用 scout 的 CurrentQuantity，
-                # 这里是唯一能批量拿到它的地方，别再单独发一轮请求。
-                try:
-                    qty = float(item.get("CurrentQuantity") or 0.0)
-                except (TypeError, ValueError):
-                    qty = 0.0
-                if qty > 0:
-                    quantities[str(api_id)] = qty
-            if len(items) < 100:
-                break
-            page += 1
+                    # 注意 PriceLogs 里偶尔夹 null，不能直接 .get
+                    # 这里只取更新时间；间隔不从这里推断——
+                    # ByCategory 的 PriceLogs 是每日一点（24h），但 CurrentPrice 实际 6 小时就变了，
+                    # 用它算间隔会得到 24 小时，把抓取节奏拖得过长。间隔交给 scout_probe_interval。
+                    for entry in (item.get("PriceLogs") or []):
+                        if not isinstance(entry, dict):
+                            continue
+                        stamp = _parse_scout_time(entry.get("Time"))
+                        if stamp > 0:
+                            sub_ts = max(sub_ts, stamp)
 
-    if source_ts:
-        with _SCOUT_LOCK:
+                    if price is None:
+                        continue
+                    try:
+                        value = float(price)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        sub_prices[str(api_id)] = value
+                    # 顺手记下库存：倒货榜的「库存」列改用 scout 的 CurrentQuantity，
+                    # 这里是唯一能批量拿到它的地方，别再单独发一轮请求。
+                    try:
+                        qty = float(item.get("CurrentQuantity") or 0.0)
+                    except (TypeError, ValueError):
+                        qty = 0.0
+                    if qty > 0:
+                        sub_qty[str(api_id)] = qty
+                if len(items) < 100:
+                    break
+                page += 1
+            return sub_prices, sub_qty, sub_ids, sub_ts
+
+        prices: dict[str, float] = {}
+        quantities: dict[str, float] = {}
+        item_ids: dict[str, int] = {}
+        # 这里只记录源数据的更新时间；更新间隔不在这里推断（见 scout_probe_interval）
+        source_ts = 0.0
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+            for sub_prices, sub_qty, sub_ids, sub_ts in pool.map(
+                fetch_one, SCOUT_CATEGORIES
+            ):
+                prices.update(sub_prices)
+                quantities.update(sub_qty)
+                item_ids.update(sub_ids)
+                source_ts = max(source_ts, sub_ts)
+
+        if source_ts:
             info = dict(_SCOUT_SOURCE.get(league) or {})
             info["aggregate_updated_at"] = int(source_ts)
             info["updated_at"] = max(int(info.get("updated_at") or 0), int(source_ts))
             _SCOUT_SOURCE[league] = info
 
-    if prices:
-        with _SCOUT_LOCK:
+        if prices:
             _SCOUT_CACHE[league] = (now, prices)
             _SCOUT_ITEM_IDS[league] = item_ids
             _SCOUT_QUANTITY[league] = (now, quantities)
-    return dict(prices)
+        return dict(prices)
 
 
 _SCOUT_PROBE_TTL = 6 * 3600
@@ -942,6 +999,11 @@ def scout_pair_stocks(
     return dict(ask), dict(bid), dict(count)
 
 
+# 基准货币小时级成交均价的缓存（只用于同轮去重，见 scout_refresh_bases）
+_SCOUT_BASES: dict[str, tuple[float, dict[str, float]]] = {}
+SCOUT_BASES_TTL = 60
+
+
 def scout_refresh_bases(league: str, prices: dict[str, float]) -> dict[str, float]:
     """用换汇明细把基准货币的价格刷新到小时级。
 
@@ -952,13 +1014,24 @@ def scout_refresh_bases(league: str, prices: dict[str, float]) -> dict[str, floa
     """
     if not prices:
         return prices
+
+    # ⚠️ 同轮去重：这个函数每个类别都会调一次，一轮 14 个类别就是 28 个请求，
+    #    而它取的「基准货币成交均价」跟类别毫无关系。
+    #    TTL 只给 60 秒——刚好覆盖一轮抓取（约 6 秒），下一轮必定重新取，
+    #    所以它仍然保持小时级的时效，只是不再把同一份数据重复取 14 遍。
     with _SCOUT_LOCK:
+        cached = _SCOUT_BASES.get(league)
+        if cached and time.time() - cached[0] < SCOUT_BASES_TTL:
+            merged = dict(prices)
+            merged.update(cached[1])
+            return merged
         item_ids = dict(_SCOUT_ITEM_IDS.get(league) or {})
     base_id = item_ids.get(SCOUT_BASE_CURRENCY)
     if not base_id:
         return prices
 
     league_part = urllib.parse.quote(league)
+    updated: dict[str, float] = {}
     for name in ("divine", "chaos"):
         target = item_ids.get(name)
         if not target or target == base_id:
@@ -989,8 +1062,13 @@ def scout_refresh_bases(league: str, prices: dict[str, float]) -> dict[str, floa
             traded = float(side.get("ValueTraded") or 0.0)
             volume = float(side.get("VolumeTraded") or 0.0)
             if traded > 0 and volume > 0:
-                prices[name] = traded / volume
-    return prices
+                updated[name] = traded / volume
+
+    with _SCOUT_LOCK:
+        _SCOUT_BASES[league] = (time.time(), updated)
+    merged = dict(prices)
+    merged.update(updated)
+    return merged
 
 
 # ------------------------------------------------------- dadsofexile 通货报价
@@ -1249,7 +1327,7 @@ def trade_post(path: str, payload: dict, *, timeout: int = 25, limiter: "TradeLi
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(request, timeout=timeout) as response:
+                with _HTTP_OPENER.open(request, timeout=timeout) as response:
                     data = json.loads(response.read().decode("utf-8", "ignore"))
                 gate.note_ok()
                 return data
@@ -2165,6 +2243,13 @@ def take_unique_snapshot(league: str, ts: int | None = None) -> int:
     return len(records)
 
 
+# 7 天趋势回填是**派生数据**：同一条 sparkline 反推出来的结果每轮都一样，
+# 但原来每一轮抓取都重算一遍（先 DELETE 3887 行、再 INSERT 3887 行），
+# 5 分钟一轮的话一小时白烧 12 次全量重写。它本来就是日线颗粒度，
+# 隔几小时重算一次完全够用。
+BACKFILL_MIN_SECONDS = 6 * 3600
+
+
 def backfill_history(league: str, ts: int) -> int:
     """用 poe.ninja 自带的近 7 天累计涨跌幅，还原出历史价格填入数据库。
 
@@ -2173,6 +2258,10 @@ def backfill_history(league: str, ts: int) -> int:
     因此 price(t) = 当前价 × (1 + p_t) / (1 + p_末)，可以反推出真实价格序列。
     这类数据标记 source='synthetic'，只用于画图与统计，不和实测数据混淆。
     """
+    last = _meta_value("backfill_at")
+    if last and int(time.time()) - last < BACKFILL_MIN_SECONDS:
+        return 0
+
     rows = db().execute(
         "SELECT currency_id, category, spark, value_divine, value_exalted, value_chaos"
         " FROM snapshot WHERE league = ? AND ts = ?"
@@ -2242,6 +2331,10 @@ def backfill_history(league: str, ts: int) -> int:
             "  value_chaos, volume, trend, spark, source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             records,
         )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_meta (k, v) VALUES ('backfill_at', ?)",
+            (str(int(time.time())),),
+        )
     return len(records)
 
 
@@ -2292,7 +2385,7 @@ def probe_updates(league: str) -> tuple[bool, int]:
             headers["If-None-Match"] = known
         try:
             request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with _HTTP_OPENER.open(request, timeout=20) as response:
                 last_code = response.status
                 etag = response.headers.get("ETag") or ""
                 response.read()  # 只是探测，内容不解析；真要抓会再请求一次
@@ -2412,17 +2505,63 @@ def save_tracker_state(tracker: UpdateTracker) -> None:
         pass
 
 
+# 并发抓类别的路数。14 个类别串行实测 46 秒，6 路并发 8.3 秒（快 5.5 倍），
+# 这是「每次打开程序都要等半天」的主因。不再往上加的原因：源站是社区接口，
+# 并发再高也没有明显收益，反而容易撞限流被惩罚；6 路是实测的甜点。
+FETCH_WORKERS = _clamp_int(CONFIG.get("fetch_workers", 6), 6, 1, 12)
+
+
+def warm_shared_sources(league: str) -> None:
+    """并发抓类别之前，先把「跟类别无关」的那几份联盟级数据取一遍。
+
+    为什么必须单独预热：fetch_category 每个类别都要 scout 汇率、doe 基准价、
+    全交易对挂出量这些**全联盟**数据。它们本身有缓存，但并发一起跑时
+    头几个线程会同时发现缓存是冷的，于是同一份数据被重复抓好几遍——
+    这是实测里首轮比后续轮慢 18 秒的真正原因（不是带宽、不是数据量）。
+    开局串行取一次把缓存喂热，后面 14 个类别就全是缓存命中。
+    """
+    if PRICE_SOURCE != "scout":
+        return
+    steps = (
+        ("scout 汇率", lambda: scout_currency_prices(league)),
+        ("scout 更新间隔", lambda: scout_probe_interval(league)),
+        ("dadsofexile 基准价", lambda: doe_prices(league)),
+        ("scout 交易对挂出量", lambda: scout_pair_stocks(league)),
+    )
+    for name, fn in steps:
+        try:
+            fn()
+        except Exception as exc:                               # noqa: BLE001
+            # 预热失败不致命： fetch_category 里还有各自的兜底与重试
+            log(f"  · {name}预热失败（不阻断抓取）：{exc}")
+
+
 def take_snapshot(league: str) -> tuple[int, int]:
-    """抓取全部类别并写入一次快照，返回 (ts, 行数)。"""
+    """抓取全部类别并写入一次快照，返回 (ts, 行数)。
+
+    类别之间并发抓取：它们彼此独立，串行只是白白把单请求的等待时间叠起来。
+    """
     ts = int(time.time())
     records: list[tuple] = []
     ok_categories: set[str] = set()
 
-    for category, _label in CATEGORIES:
+    def grab(item: tuple[str, str]) -> tuple[str, list | None, str | None]:
+        category, _label = item
         try:
             rows, _fe, _fc, _fd = fetch_category(league, category)
-        except Exception as exc:  # noqa: BLE001
-            log(f"  × {category} 抓取失败：{exc}")
+        except Exception as exc:                               # noqa: BLE001
+            return category, None, str(exc)[:120]
+        return category, rows, None
+
+    warm_shared_sources(league)
+
+    # pool.map 保序：结果顺序跟 CATEGORIES 一致，写库顺序稳定，便于对照日志
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        results = list(pool.map(grab, CATEGORIES))
+
+    for category, rows, error in results:
+        if error is not None:
+            log(f"  × {category} 抓取失败：{error}")
             continue
         for row in rows:
             if not row["id"]:
@@ -2444,7 +2583,6 @@ def take_snapshot(league: str) -> tuple[int, int]:
                 )
             )
         ok_categories.add(category)
-        time.sleep(0.4)  # 对社区接口保持礼貌
 
     if not records:
         raise RuntimeError("本次抓取没有拿到任何数据")
@@ -2480,23 +2618,50 @@ def sync_from_cloud() -> dict:
 
     import urllib.request
 
-    try:
+    def grab(url: str) -> dict:
         # 本机请求绕开系统代理，否则会被网关挡成 502
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(
-            urllib.request.Request(CLOUD_SYNC_URL, headers={"User-Agent": USER_AGENT}),
+            urllib.request.Request(url, headers={"User-Agent": USER_AGENT}),
             timeout=CLOUD_SYNC_TIMEOUT,
         ) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    try:
+        payload = grab(CLOUD_SYNC_URL)
     except Exception as exc:                                   # noqa: BLE001
-        log(f"  · 云端同步失败（不影响本机抓取）：{exc}")
-        return {"ok": False, "reason": str(exc)[:120]}
+        if not CLOUD_SYNC_URL_RAW:
+            log(f"  · 云端同步失败（不影响本机抓取）：{exc}")
+            return {"ok": False, "reason": str(exc)[:120]}
+        try:
+            payload = grab(CLOUD_SYNC_URL_RAW)
+            log(f"  · jsDelivr 取不到（{exc}），已改走 raw 源")
+        except Exception as exc2:                               # noqa: BLE001
+            log(f"  · 云端同步失败（不影响本机抓取）：{exc2}")
+            return {"ok": False, "reason": str(exc2)[:120]}
+
+    # CDN 那份可能是几小时前的旧版：看 generated 判断，过期就换直连源再拿一次，
+    # 两边都有就取更新的那份。补历史数据时旧版也能用，但最新的点只有新版才有。
+    generated = int(payload.get("generated") or 0)
+    if CLOUD_SYNC_URL_RAW and generated:
+        age_hours = (time.time() - generated) / 3600.0
+        if age_hours > CLOUD_STALE_HOURS:
+            try:
+                alt = grab(CLOUD_SYNC_URL_RAW)
+            except Exception:                                   # noqa: BLE001
+                alt = {}
+            if int(alt.get("generated") or 0) > generated:
+                log(f"  · jsDelivr 这份是 {age_hours:.1f} 小时前的旧版，改用 raw 源的新版")
+                payload = alt
 
     stamps = payload.get("ts") or []
     items = payload.get("items") or {}
     league = str(payload.get("league") or STATE.get("league") or "")
     if not stamps or not items or not league:
         return {"ok": False, "reason": "云端数据为空"}
+    _gen = int(payload.get("generated") or 0)
+    _age = f"{(time.time() - _gen) / 3600.0:.1f} 小时前" if _gen else "未知时间"
+    log(f"  · 云端数据：{len(stamps)} 个时间点 / {len(items)} 个通货（生成于 {_age}）")
 
     import bisect
 
@@ -3631,7 +3796,7 @@ def trade_get(path: str, *, timeout: int = 25, limiter: "TradeLimiter | None" = 
                 request = urllib.request.Request(
                     url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
                 )
-                with urllib.request.urlopen(request, timeout=timeout) as response:
+                with _HTTP_OPENER.open(request, timeout=timeout) as response:
                     data = json.loads(response.read().decode("utf-8", "ignore"))
                 gate.note_ok()
                 return data
@@ -4481,7 +4646,11 @@ class Handler(BaseHTTPRequestHandler):
                 base = args.get("base", ["exalted"])[0]
                 if base not in BASE_COLUMNS:
                     base = "exalted"
-                hours = _safe_int(args.get("hours", ["24"])[0], 24, 1, 24 * 30)
+                # 上限必须跟着 retention_days 走：超出保留期的区间根本没有数据，
+                # 放它过去只会让人以为能查 30 天。原来写死 24*30，和 3 天保留期对不上。
+                hours = _safe_int(
+                    args.get("hours", ["24"])[0], 24, 1, 24 * RETENTION_DAYS
+                )
                 self._json(
                     rows_to_items(
                         base, args.get("category", ["all"])[0], args.get("q", [""])[0], hours
@@ -4931,7 +5100,11 @@ def main() -> None:
     # 拉不到就静默跳过，不影响本机抓取与界面。
     if CLOUD_SYNC_URL:
         CloudSyncWorker().start()
-        log(f"云端补数据已启用（每 {CLOUD_SYNC_INTERVAL // 60} 分钟一次）")
+        # ⚠️ 这句说的是「本机多久去云端取一次」，不是「云端多久抓一轮」——
+        #    后者由 GitHub Actions 的 cron 决定。两者以前都写成「每 N 分钟一次」，
+        #    容易让人以为云端抓取频率被改了，所以这里必须点明是本机拉取间隔。
+        log(f"云端补数据已启用（本机每 {CLOUD_SYNC_INTERVAL // 60} 分钟拉一次云端数据；"
+            f"云端抓取由 GitHub Actions 定时执行）")
 
     server, port = bind_server()
     server.worker = worker  # type: ignore[attr-defined] - 供 HTTP handler 调用切换联盟
