@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.5"
+VERSION = "1.27.6"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -162,7 +162,9 @@ DEFAULT_CONFIG: dict = {
     # 第二道「僵住」判据：价格指纹连续这么久完全没变，就当 doe 在返回僵数据
     # （2026-09-28 实测：时间戳每 15 分钟在动，价格却 7 小时不动，
     #   只比时间戳的检测抓不到这种情况）。超时后本轮回退 poe2scout。
-    "doe_frozen_seconds": 2700,  # 45 分钟
+    # ⚠️ 别设太短：doe 正常就是 40~100 分钟才整体刷新一次，
+    #    设成 45 分钟会在它正常待着的时候误判、来回切源把价格抖出 10% 的台阶。
+    "doe_frozen_seconds": 9000,  # 2.5 小时
     "spread_refs": ["chaos"],    # 自动扫描用哪些基准货币（与页面差价榜默认基准保持一致）
     "spread_window_hours": 24,   # 榜单展示窗口：多久之内扫到的挂单仍然展示
     "spread_rescan_minutes": 360, # 同一个通货隔多久才重新扫一次（配额有限，别调太小）
@@ -1106,11 +1108,19 @@ DOE_STALE_SECONDS = _clamp_int(
     CONFIG.get("doe_stale_seconds", 90 * 60), 90 * 60, 10 * 60, 24 * 3600
 )
 # 「价格指纹」连续不变的容忍时长：超过它就判定 doe 在返回僵数据。
-# 只在 doe 真的僵住时才生效（会改用 scout 价），正常行情下完全不触发，
-# 所以宁可设短一点早发现，也别让一份 7 小时前的复印件被当成实时价。
+# ⚠️ 阈值必须明显大于 doe 自己的刷新间隔。实测它正常时 40~100 分钟整体刷一次，
+#    凌晨最久一次隔了 398 分钟；而它僵住时是**整整 8 小时一个小数位都不动**。
+#    取 2.5 小时：正常刷新不会误伤，真僵了也能在两个半小时内切走。
+#    （2026-09-28 第一次设成 45 分钟，结果每次 doe 正常待着就被误判成僵，
+#     反复在 doe / scout 之间横跳，神圣石汇率跟着抖出 10% 的台阶。）
+#   下限压在 2 小时：早先写过 45 分钟的那批 config.json 会被夹上来，
+#   否则老用户一升级反而更容易被误判。
 DOE_FROZEN_SECONDS = _clamp_int(
-    CONFIG.get("doe_frozen_seconds", 45 * 60), 45 * 60, 10 * 60, 24 * 3600
+    CONFIG.get("doe_frozen_seconds", 150 * 60), 150 * 60, 120 * 60, 24 * 3600
 )
+# 一轮里至少有多大比例的「可用条目」价格变了，才算 doe 真的刷新过。
+# 它一次正常刷新会让几百项一起变（实测 500~650 项）；僵住时只有零星几项在动。
+DOE_REFRESH_MIN_RATIO = 0.02
 
 _DOE_LOCK = threading.RLock()
 _DOE_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
@@ -1151,33 +1161,134 @@ def doe_stale(league: str) -> tuple[bool, int]:
 # 所以这里对每次拿到的价格算一个指纹，记住"这份指纹第一次是什么时候见到的"；
 # 只要指纹长时间不变，不管 fetched_at 多新鲜，都判僵住并回退 scout。
 # --------------------------------------------------------------------------
-_DOE_FP: dict[str, tuple[str, float]] = {}   # 联盟 -> (价格指纹, 首次见到该指纹的时刻)
+_DOE_FP: dict[str, tuple[str, float]] = {}    # 联盟 -> (价格指纹, 首次见到该指纹的时刻)
+_DOE_LAST: dict[str, dict[str, float]] = {}  # 联盟 -> 上一轮各可用条目的价格
 _DOE_FP_LOCK = threading.Lock()
+_DOE_STATE_FILE = DATA_DIR / "doe_freshness.json"
+_DOE_STATE_LOADED = False
+_DOE_NOISE_TS: dict[str, float] = {}
 
 
-def _doe_fingerprint(flat: dict[str, dict]) -> str:
-    """对一批价格算指纹（只看价格，不看时间戳）。"""
+def _doe_usable(flat: dict[str, dict]) -> dict[str, float]:
+    """只挑出「真的会被拿来取价」的条目（ok=True）来算指纹。
+
+    ⚠️ 2026-09-28 实测踩的坑（v1.27.5 修了却没修好的那个）：
+       原来对 doe 返回的**全部**条目算指纹，结果它「交易所」那部分价格
+       从 15:27 起整整 8 小时一个小数位都没动，但每轮总有 20 来个条目在变——
+       那些是 doe 压根没有（灵魂核心、三维宝珠之类）或只标 scout-blend 的，
+       走的是 scout，跟着 scout 十几分钟动一次。
+       于是全局指纹每隔十几分钟就被重置，「僵住」判定永远差一点点、
+       一次都没触发过，程序就这么把一份 8 小时前的复印件当实时价用了 8 小时。
+       所以指纹只能覆盖**我们真的从 doe 取价**的那部分（实测 635 条里 232 条）。
+    """
+    # 没带 ok 标记的（调用方直接喂的一份价格表）一律当可用。
+    return {
+        key: float(val.get("price") or 0.0)
+        for key, val in flat.items()
+        if isinstance(val, dict) and val.get("ok", True)
+    }
+
+
+def _doe_hash_prices(prices: dict[str, float]) -> str:
+    """对一份「通货 -> 价格」算指纹（只看价格，不看时间戳）。"""
     try:
         import hashlib
 
         digest = hashlib.sha1()
-        for key in sorted(flat):
-            digest.update(f"{key}:{flat[key].get('price')!r};".encode("utf-8"))
+        for key in sorted(prices):
+            digest.update(f"{key}:{prices[key]!r};".encode("utf-8"))
         return digest.hexdigest()
     except Exception:  # noqa: BLE001
         return ""
 
 
+def _doe_fingerprint(flat: dict[str, dict]) -> str:
+    """对一批报价算指纹：只看价格、不看时间戳，且只看会被采用的那部分。"""
+    return _doe_hash_prices(_doe_usable(flat))
+
+
+def _doe_state_load() -> None:
+    """把上次记下的指纹读回来，免得重启后要白等一个判定周期。
+
+    doe 一僵就是好几个小时，而判据是「这份指纹多久没变」；不落盘的话
+    每次启动都从零开始计时，偏偏刚打开程序这段时间最容易被僵数据糊脸。
+    只有在指纹还对得上时才认这份记录——doe 若已经刷过，指纹不同会自动重置。
+    """
+    global _DOE_STATE_LOADED
+    if _DOE_STATE_LOADED:
+        return
+    _DOE_STATE_LOADED = True
+    try:
+        with open(_DOE_STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    for league, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        fp = str(entry.get("fp") or "")
+        seen = float(entry.get("seen") or 0)
+        if fp and 0 < seen <= now:
+            _DOE_FP[str(league)] = (fp, seen)
+
+
+def _doe_state_save() -> None:
+    """把指纹写盘。写失败无所谓，最坏是下次启动多等一个周期。"""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {lg: {"fp": fp, "seen": seen} for lg, (fp, seen) in _DOE_FP.items()}
+        # 用字符串拼而不是 with_suffix：调用方（自检）可能把路径换成 str
+        tmp = Path(f"{_DOE_STATE_FILE}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, _DOE_STATE_FILE)
+    except OSError:
+        pass
+
+
 def doe_note_prices(league: str, flat: dict[str, dict]) -> None:
-    """每次真正取到 doe 数据后记一笔指纹（价格一变就重置计时）。"""
-    fp = _doe_fingerprint(flat)
-    if not fp or not flat:
+    """每次真正取到 doe 数据后记一笔指纹：价格**整体**变过才重置计时。
+
+    ⚠️ 「变过」必须看变动比例，不能只看指纹相不相同：
+       僵住时照样有零星几条在动（走 scout 的那些），指纹一变计时就被重置。
+       doe 一次真刷新是几百项一起动（实测 500~650 项），
+       个位数变化只能算噪音，不算刷新。
+    """
+    usable = _doe_usable(flat)
+    if not usable:
+        return
+    fp = _doe_hash_prices(usable)
+    if not fp:
         return
     now = time.time()
     with _DOE_FP_LOCK:
+        _doe_state_load()
+        prev_prices = _DOE_LAST.get(league) or {}
+        changed = sum(
+            1
+            for key, value in usable.items()
+            if key not in prev_prices or abs(prev_prices[key] - value) > 1e-9
+        )
+        _DOE_LAST[league] = usable
         prev = _DOE_FP.get(league)
-        if prev is None or prev[0] != fp:
+        if prev is None:
             _DOE_FP[league] = (fp, now)
+            _doe_state_save()
+            return
+        if prev[0] == fp:
+            return  # 一点没变，继续累计僵住时长
+        ratio = changed / max(len(usable), 1)
+        if ratio < DOE_REFRESH_MIN_RATIO:
+            if now - float(_DOE_NOISE_TS.get(league) or 0) > 30 * 60:
+                _DOE_NOISE_TS[league] = now
+                log(f"  · dadsofexile 本轮只有 {changed}/{len(usable)} 项价格变动"
+                    f"（{ratio:.1%}），达不到有效刷新门槛，不计入刷新")
+            return
+        _DOE_FP[league] = (fp, now)
+        _doe_state_save()
 
 
 def doe_frozen(league: str) -> tuple[bool, int]:
@@ -1185,9 +1296,11 @@ def doe_frozen(league: str) -> tuple[bool, int]:
 
     与 doe_stale() 互补：那个看时间戳新旧，这个看**价格本身**有没有变。
     两者任一成立都应回退 scout —— 只有时间戳在动、价格不动这种情况，
-    光看时间戳是抓不到的。
+    光看时间戳是抓不到的：它自报的 fetched_at 一直很新，
+    实测僵了 8 小时也照样写着「1 分钟前才抓的」，完全不能信。
     """
     with _DOE_FP_LOCK:
+        _doe_state_load()
         entry = _DOE_FP.get(league)
     if not entry:
         return False, 0
