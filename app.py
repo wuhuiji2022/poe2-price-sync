@@ -43,7 +43,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.2"
+VERSION = "1.27.3"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -2653,6 +2653,23 @@ def sync_from_cloud() -> dict:
             if int(alt.get("generated") or 0) > generated:
                 log(f"  · jsDelivr 这份是 {age_hours:.1f} 小时前的旧版，改用 raw 源的新版")
                 payload = alt
+
+    # ★ 云端跑的是仓库里那份 app.py（cloud_fetch.py 是 import app 的）。
+    #   万一哪次封包后忘了把新 app.py 推上去，云端就会一直用旧口径抓；
+    #   那种数据补进来会和本机数据混成两套口径，算出来的涨跌更不可信。
+    #   所以先比对生成它的版本号：前两段（大版本.次版本）不一致就拒绝，
+    #   只差补丁号（1.27.2 / 1.27.3）放行——那种通常只是修 bug，不改抓取口径。
+    #   老数据里没有这个字段时按“未知”处理并放行，否则加了字段反而全补不进来。
+    def _compat(v: str) -> str:
+        parts = str(v or "").split(".")
+        return ".".join(parts[:2]) if len(parts) >= 2 else str(v or "")
+
+    cloud_ver = str(payload.get("app_version") or "")
+    if cloud_ver and _compat(cloud_ver) != _compat(VERSION):
+        log(f"  · 云端数据由 v{cloud_ver} 生成，本机 v{VERSION}，抓取口径可能不一致，本次不补")
+        log("  · 处理办法：把新的 app.py 推到 GitHub（python _push_github.py）")
+        return {"ok": False,
+                "reason": f"云端版本 v{cloud_ver} 与本机 v{VERSION} 不一致"}
 
     stamps = payload.get("ts") or []
     items = payload.get("items") or {}

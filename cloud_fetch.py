@@ -15,6 +15,7 @@
 输出格式（列式：时间戳只存一份、通货 id 只存一份）：
   {
     "v": 1, "generated": <ts>, "league": "...", "window_hours": 48,
+    "app_version": "1.27.3",          ← 生成这份数据的 app.py 版本，客户端会校验
     "ts": [1696000000, ...],
     "items": {"<currency_id>": {"cat": "...",
                                 "d": [...], "e": [...], "c": [...],
@@ -159,6 +160,10 @@ def main() -> int:
     data["generated"] = int(ts)
     data["league"] = LEAGUE
     data["window_hours"] = WINDOW_HOURS
+    # ⚠️ 记下「这份数据是哪个版本的 app.py 抓的」。客户端会拿它跟自己的版本比，
+    #    前两段不一致就拒绝补入——免得哪次忘了把新 app.py 推到 GitHub，
+    #    云端一直用旧口径抓，补进来和本机数据混成两套口径。
+    data["app_version"] = app.VERSION
 
     DATA_FILE.write_text(
         json.dumps(data, ensure_ascii=False, separators=(",", ":")),
