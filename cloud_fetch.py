@@ -83,11 +83,18 @@ def _pad(item: dict, length: int) -> None:
             arr.append(None)
 
 
-def append_snapshot(data: dict, rows) -> int:
-    """把这一轮快照写进列式结构。返回本轮写入的条目数。"""
+def append_snapshot(data: dict, rows, ts: int | None = None) -> int:
+    """把这一轮快照写进列式结构。返回本轮写入的条目数。
+
+    ⚠️ ts 最好显式传进来：开了 skip_unchanged 之后，取到的行可能是「沿用上一次
+    的值」（时间戳早于本轮），拿 rows[0]['ts'] 当本轮时间会把整条时间轴写歪。
+    不传时按行内时间戳兜底（老调用方 / 旧测试就是这么传的）。
+    """
     if not rows:
         return 0
-    ts = int(rows[0]["ts"])
+    if ts is None:
+        ts = int(dict(rows[0]).get("ts") or 0)
+    ts = int(ts)
     if ts in data["ts"]:
         idx = data["ts"].index(ts)
     else:
@@ -141,11 +148,18 @@ def main() -> int:
     print(f"抓取 {LEAGUE} …")
     ts, count = app.take_snapshot(LEAGUE)
 
-    # 只取本轮真实抓取的行：backfill_history 写的 synthetic 行时间戳在很早以前，
-    # 用 ts 精确限定就不会混进来
+    # 每个通货取「时间戳不超过本轮」的最新一行。
+    # 为什么不能写 `WHERE ts = ?` 精确限定：v1.27.7 起本机只在值变化时才写库，
+    # 价格没动的通货这一轮根本没有新行，精确限定会取不到它们，
+    # 列式数组里就出现空洞（客户端补数据时那一格是 null，等于白补一个时间点）。
+    # 改成「取最近一行」后，没变化的通货会自然沿用上次的值填进本轮，数组与 ts 等长。
+    # 同时排除 synthetic：那是 7 天日线反推的历史点，不能当本轮实测值。
     rows = app.db().execute(
-        "SELECT ts, currency_id, category, value_divine, value_exalted, value_chaos,"
-        " orders, stock FROM snapshot WHERE league = ? AND ts = ?",
+        "SELECT currency_id, category, MAX(ts) AS mts, value_divine, value_exalted,"
+        " value_chaos, orders, stock"
+        " FROM snapshot WHERE league = ? AND ts <= ?"
+        " AND (source IS NULL OR source != 'synthetic')"
+        " GROUP BY currency_id",
         (LEAGUE, ts),
     ).fetchall()
     if not rows:
@@ -153,7 +167,7 @@ def main() -> int:
         return 1
 
     data = load_existing()
-    written = append_snapshot(data, rows)
+    written = append_snapshot(data, rows, ts)
     dropped = prune(data)
     normalize(data)          # 写盘前再兜一次，保证落盘的数组一定与 ts 等长
     data["v"] = 1
