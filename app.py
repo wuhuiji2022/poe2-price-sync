@@ -36,7 +36,7 @@ import urllib.request
 import webbrowser
 import statistics
 import datetime as dt
-from datetime import datetime, timezone
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -241,13 +241,6 @@ def enabled_unique_categories() -> list[tuple[str, str]]:
     ]
 
 
-def set_config_value(key: str, value) -> None:
-    CONFIG[key] = value
-    save_config(CONFIG)
-    if key == "name_zh_overrides":
-        invalidate_zh_overrides()
-
-
 # 国际服官方 CDN，按优先级尝试；全部失败才回落到国服
 IMAGE_HOSTS = (
     "https://web.poecdn.com",
@@ -434,6 +427,15 @@ AUTO_INTERVAL = bool(CONFIG.get("auto_interval", True))
 # 自动间隔的上下限：再快也不低于 30 分钟（要给足采样密度），再慢不超过 6 小时
 AUTO_INTERVAL_MIN = 30 * 60
 AUTO_INTERVAL_MAX = 6 * 60 * 60
+# ★ 只在「值真的变了」时才写库（v1.27.7）。
+# 为什么：本机 5 分钟一采，而 dadsofexile 约 10 分钟才重算一次，
+# 且它用上千万成交量算加权价，天然稳定——2026-09-29 实测最近 30 轮快照
+# **98% 的行与上一轮完全相同**（18797 行里 18430 行是重复值）。
+# 这些重复行既撑大数据库（5.7 小时就写进去 1.8 万行），又让「抓取完成，写入 N 行」
+# 的 N 虚高，看不出到底有没有新东西。改成变化才写：值没动就不落行，
+# 曲线和 MIN/MAX 算出来的波动完全不变（重复点本来也不提供新信息）。
+# 关掉它就退回老行为（每轮全量写）。
+SKIP_UNCHANGED = bool(CONFIG.get("skip_unchanged", True))
 PORT = int(CONFIG.get("port", 8712))
 # 监听地址：0.0.0.0 = 局域网内其他设备也能打开；改回 127.0.0.1 就只允许本机访问
 HOST = str(CONFIG.get("host") or "0.0.0.0").strip()
@@ -636,9 +638,6 @@ def zh_overrides() -> dict[str, str]:
     return _ZH_OVERRIDE_CACHE
 
 
-def invalidate_zh_overrides() -> None:
-    global _ZH_OVERRIDE_CACHE
-    _ZH_OVERRIDE_CACHE = None
 
 
 def has_cjk(text: str) -> bool:
@@ -2820,10 +2819,41 @@ def warm_shared_sources(league: str) -> None:
             log(f"  · {name}预热失败（不阻断抓取）：{exc}")
 
 
+def last_snapshot_values(league: str, before_ts: int) -> dict[str, tuple]:
+    """每个通货「最后一次写进库」的值（只取 ts 早于 before_ts 的）。
+
+    用来判断本轮抓到的值有没有变。用「最后一次写入」而不是「上一轮」——
+    开了 skip_unchanged 之后两者可能隔了好几轮，比对了才有意义。
+    ⚠️ 排除 synthetic：那是 poe.ninja 日线反推的历史点，拿它当基线会把
+    真实值误判成「没变化」而漏写。
+    """
+    try:
+        rows = db().execute(
+            "SELECT currency_id, MAX(ts) AS mts, value_divine, value_exalted,"
+            " value_chaos, stock, orders"
+            " FROM snapshot WHERE league = ? AND ts < ?"
+            " AND (source IS NULL OR source != 'synthetic')"
+            " GROUP BY currency_id",
+            (league, before_ts),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - 读不到就当没有基线，本轮照写
+        return {}
+    return {
+        r["currency_id"]: (
+            r["value_divine"], r["value_exalted"], r["value_chaos"],
+            r["stock"], r["orders"],
+        )
+        for r in rows
+        if r["currency_id"]
+    }
+
+
 def take_snapshot(league: str) -> tuple[int, int]:
     """抓取全部类别并写入一次快照，返回 (ts, 行数)。
 
     类别之间并发抓取：它们彼此独立，串行只是白白把单请求的等待时间叠起来。
+    行数可能是 0：开了 skip_unchanged 且本轮所有价格都没变化时就是这样，
+    属于正常情况，不是抓取失败（失败仍然会抛异常）。
     """
     ts = int(time.time())
     records: list[tuple] = []
@@ -2868,8 +2898,30 @@ def take_snapshot(league: str) -> tuple[int, int]:
             )
         ok_categories.add(category)
 
-    if not records:
+    fetched = len(records)
+    if not fetched:
         raise RuntimeError("本次抓取没有拿到任何数据")
+
+    # ★ 去重：与上次写进库的值完全一样的行不再写一遍。
+    #   5 分钟一采 × 源 10 分钟一刷 × 加权价本就稳定 = 绝大多数轮次是重复值。
+    if SKIP_UNCHANGED:
+        previous = last_snapshot_values(league, ts)
+        if previous:
+            kept = []
+            for rec in records:
+                current = (rec[4], rec[5], rec[6], rec[10], rec[11])
+                if previous.get(rec[3]) == current:
+                    continue
+                kept.append(rec)
+            skipped = len(records) - len(kept)
+            if skipped:
+                records = kept
+                log(f"  · {skipped} 个通货价格与上次记录完全相同，跳过写入（共 {fetched} 个）")
+
+    if not records:
+        # 抓到了、但一个都没变。这不是失败，只是这段时间行情没动。
+        log(f"  ✓ 本轮 {fetched} 个通货价格均无变化，未写入新行")
+        return ts, 0
 
     with db() as connection:
         connection.executemany(
@@ -4539,13 +4591,6 @@ def trade_get(path: str, *, timeout: int = 25, limiter: "TradeLimiter | None" = 
     raise RuntimeError(f"交易接口请求失败 {url} -> {last}")
 
 
-def _indexed_ts(text: str) -> int:
-    """挂单上架时间 "2026-09-22T10:11:12Z" → 时间戳。"""
-    try:
-        dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except (TypeError, ValueError):
-        return 0
 
 
 def currency_value_map(league: str) -> dict[str, float]:
@@ -4564,98 +4609,6 @@ def currency_value_map(league: str) -> dict[str, float]:
             out[r["currency_id"]] = float(v)
     return out
 
-
-def parse_listing_mods(item: dict) -> list[dict]:
-    """解析一条挂单的词缀。
-
-    PoE2 官方接口给的是对象：description 里带**这一件的实际数值**（如 +86），
-    magnitudes 只给该词缀的取值区间，所以要归因得读 description。
-    """
-    out: list[dict] = []
-    for domain, key in (("implicit", "implicitMods"), ("explicit", "explicitMods")):
-        for raw in item.get(key) or []:
-            if isinstance(raw, dict):
-                text = str(raw.get("description") or "")
-                stat_hash = str(raw.get("hash") or "")
-            else:
-                text, stat_hash = str(raw), ""
-            if not text:
-                continue
-            en = zhdict.clean_en(text)
-            _, nums = zhdict.template_of(en)
-            out.append(
-                {
-                    "domain": domain,
-                    "hash": stat_hash,
-                    "en": en,
-                    "zh": ZH.mod(text),
-                    "value": float(nums[0]) if nums else None,
-                    "tmpl": zhdict.template_of(en)[0],
-                }
-            )
-    return out
-
-
-# 官方挂单的「新鲜度」阈值：挂太久的多半是没人要的僵尸单，只当参考不打折计算
-LISTING_FRESH_HOURS = 48
-
-
-def _query_listings(
-    league: str,
-    name: str,
-    corrupted: bool,
-    sort: dict,
-    size: int,
-    values: dict[str, float],
-) -> tuple[list[dict], int]:
-    """按给定排序拉一批挂单，返回 (挂单列表, 市场上该侧的总挂单数)。"""
-    payload = {
-        "query": {
-            "status": {"option": "online"},
-            "name": name,
-            "filters": {
-                "misc_filters": {
-                    "filters": {"corrupted": {"option": "true" if corrupted else "false"}}
-                }
-            },
-        },
-        "sort": sort,
-    }
-    data = trade_post(f"/search/poe2/{urllib.parse.quote(league)}", payload)
-    query_id = str(data.get("id") or "")
-    hashes = (data.get("result") or [])[:size]
-
-    rows: list[dict] = []
-    if hashes and query_id:
-        for i in range(0, len(hashes), 10):
-            chunk = hashes[i:i + 10]
-            fetched = trade_get(f"/fetch/{','.join(chunk)}?query={urllib.parse.quote(query_id)}")
-            for entry in fetched.get("result") or []:
-                listing = entry.get("listing") or {}
-                item = entry.get("item") or {}
-                price = listing.get("price") or {}
-                amount = float(price.get("amount") or 0)
-                # 注意：货币种类在 currency 键里，type 是定价方式（exact 一口价 / ~price 议价）
-                currency = str(price.get("currency") or "")
-                price_kind = str(price.get("type") or "")
-                per = values.get(currency)
-                if not per or amount <= 0:
-                    continue
-                indexed = _indexed_ts(listing.get("indexed") or "")
-                age_h = (time.time() - indexed) / 3600.0 if indexed else None
-                rows.append(
-                    {
-                        "id": str(entry.get("id") or ""),
-                        "value": amount * per,  # 统一折算成神圣石
-                        "amount": amount,
-                        "currency": currency,
-                        "exact": price_kind == "exact",
-                        "age_h": age_h,
-                        "fresh": bool(age_h is not None and age_h <= LISTING_FRESH_HOURS),
-                        "mods": parse_listing_mods(item),
-                    }
-                )
-    return rows, int(data.get("total") or 0)
 
 
 
