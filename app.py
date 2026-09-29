@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.8"
+VERSION = "1.27.9"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -710,6 +710,20 @@ def http_json(url: str, *, retries: int = 3, timeout: int = 30):
 # 短时间内反复请求拿到的完全是同一个数，所以缓存给到 30 分钟——
 # 既避开 6 小时的盲区，也不至于白白去打第三方接口。
 SCOUT_TTL_SECONDS = 30 * 60
+
+# ★★ scout 数据的最大可采信年龄。
+#
+# 2026-09-29 事故：poe2scout 整站停更（ExchangeSnapshot 卡在 09-28 08:00，22 小时没动），
+# 但它照旧返回一份陈旧快照——价格、挂出量、求购量全是 22 小时前的数。
+# 我们的逐条取价优先级是写死的 doe > scout > ninja，只要 scout 有这条数据，
+# **哪怕它已经停更 22 小时，也轮不到更新的 poe.ninja**，于是这些通货整体冻结。
+#
+# scout 标称小时级刷新，取 3 小时当门槛（3 倍标称值，正常波动不会误伤）。
+# 超过门槛就整份不参与逐条取价与挂出量取值，让位给 doe / ninja。
+# 拿不到它的时间戳时不拦（保持老行为），免得缺字段反而把它一票否决。
+SCOUT_MAX_AGE_SECONDS = _clamp_int(
+    CONFIG.get("scout_max_age_seconds", 3 * 3600), 3 * 3600, 3600, 7 * 24 * 3600
+)
 _SCOUT_LOCK = threading.Lock()
 _SCOUT_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 # 各通货在 scout 里的数字 id，换汇明细接口只认这个 id
@@ -956,6 +970,29 @@ def scout_source_info(league: str) -> dict[str, int]:
         return dict(_SCOUT_SOURCE.get(league) or {"updated_at": 0, "interval_seconds": 0})
 
 
+def scout_qty_status(league: str) -> dict:
+    """挂出量 / 求购量来源的健康状况。
+
+    这两个数**只有 poe2scout 一家给**（poe.ninja 只有成交量、doe 只有桥接对的量），
+    所以它一停更就没有替代源，界面上会整片变成「—」。
+    ⚠️ 那就必须把「源停更了」这件事明确说出来——否则用户看到一片「—」，
+    只会以为程序坏了，而实际是上游挂了、程序正在如实报空。
+    """
+    try:
+        ts = int(scout_source_info(league).get("updated_at") or 0)
+    except Exception:  # noqa: BLE001 - 状态查询不该影响主流程
+        ts = 0
+    if not ts:
+        return {"ok": False, "stale_hours": 0.0, "reason": "拿不到 poe2scout 的数据时间"}
+    age = max(int(time.time()) - ts, 0)
+    fresh = age <= SCOUT_MAX_AGE_SECONDS
+    return {
+        "ok": fresh,
+        "stale_hours": round(age / 3600, 1),
+        "reason": "" if fresh else f"挂出量来源 poe2scout 已 {age // 3600} 小时没更新，暂时无法提供实时挂单量",
+    }
+
+
 def scout_quantities(league: str) -> dict[str, float]:
     """scout 给的库存（ByCategory 的 CurrentQuantity）。
 
@@ -1137,6 +1174,23 @@ def scout_refresh_bases(league: str, prices: dict[str, float]) -> dict[str, floa
 DOE_TTL_SECONDS = 4 * 60      # 它刷新很快，缓存别开太久，否则白瞎了它的优势
 DOE_MIN_ORDERS = 100          # 挂单少于这个数，价格不采信（实测 p50 只有 57）
 DOE_TIMEOUT = 15              # 个人小站，别让它卡住整轮抓取
+
+# ★★ 桥接价（exchange-bridged）：交易所里没有直接挂单，但 doe 用桥接汇率给了一个实时价。
+#
+# 2026-09-29 事故的根子就在这里：原先的采信条件只有 `order_book >= 100`，
+# 而 bridged 条目**按定义** order_book 就是 0（它压根不在通货交易所直接挂单），
+# 于是这 154 条全被判不可用 → 逐条取价降级到 poe2scout → 而 scout 已停更 22 小时
+# → 这些通货的价格、挂出量、求购量整体冻结（用户截图里那条从 09-28 15:12 起
+#   一动不动的直线就是这个）。
+#
+# 拿 poe.ninja 当基准交叉验证过（只取 ninja 以神圣石计价、量级可信的那批）：
+#   · 59 个 bridged 条目里，与 ninja 的中位偏差 4.4%，52.5% 落在 5% 以内；
+#   · 贵重物品尤其准：mirror 0.46%、hinekoras-lock 0.62%、uul-netols-embrace 0.28%。
+#   · 对照：现行采信档（order_book>=100）同一口径下中位偏差 14.0%。
+# 所以 bridged 价是**可以采信**的，而且它是「有价可用」和「拿停更源的旧价」之间的分水岭。
+# 仍保留占位假价过滤（价格恰好=1 / =chaos / =divine 的一律不采）。
+DOE_BRIDGED_SRC = "exchange-bridged"
+# 数据来源：https://dadsofexile.com/api/prices 的 price_source 字段
 
 DOE_INTERVAL_SECONDS = 30 * 60   # 实测几分钟到二十分钟刷一次，取 30 分钟当保守标称
 # 标记间隔是 30 分钟，超过这个时长还没刷新就认为它「僵住了」：
@@ -1368,8 +1422,13 @@ def pick_ask_bid(
 
     降级顺序：scout SnapshotPairs → scout ByCategory 库存 → doe → 0。
     doe 僵住时不拿它兜底，避免旧数据冒充实时量；都没数就如实存 0（前端显示「—」）。
+
+    ⚠️ doe 的桥接价条目（qty_ok=False）也不许兜底：它的 quantity / order_book
+       是**桥接交易对**的量，不是本物品挂了多少，拿它当挂出量就是又混了一次口径。
     """
     src = None if doe_is_stale else doe_row
+    if src is not None and not src.get("qty_ok", True):
+        src = None
 
     def first(*values: float) -> float:
         for value in values:
@@ -1449,6 +1508,9 @@ def doe_prices(league: str, *, force: bool = False) -> dict[str, dict]:
             "stock": float(item.get("quantity") or 0.0),
             "orders": int(item.get("order_book") or 0),
             "src": str(item.get("price_source") or ""),
+            # 桥接价的成交量（桥接交易对的量，不是本物品的量）——
+            # 只用来判断「这条桥接价有没有真实市场支撑」，不对外展示。
+            "exchange_volume": float(item.get("exchange_volume") or 0.0),
         }
 
     if not flat:
@@ -1464,11 +1526,27 @@ def doe_prices(league: str, *, force: bool = False) -> dict[str, dict]:
     for key, entry in flat.items():
         if key in ("divine", "chaos", "exalted"):
             entry["ok"] = entry["price"] > 0
-        else:
-            entry["ok"] = (
-                entry["orders"] >= DOE_MIN_ORDERS
-                and not doe_placeholder(entry["price"], chaos, divine)
-            )
+            entry["qty_ok"] = True
+            continue
+        # 占位假价（恰为 1.00 / chaos / divine）一律不采信，跟挂单多少无关
+        if doe_placeholder(entry["price"], chaos, divine):
+            entry["ok"] = False
+            entry["qty_ok"] = False
+            continue
+        # 挂单够多 → 直接采信，且它的 stock/orders 是可信的「本物品」数量
+        if entry["orders"] >= DOE_MIN_ORDERS:
+            entry["ok"] = True
+            entry["qty_ok"] = True
+            continue
+        # 桥接价：order_book 恒为 0，但 doe 用桥接汇率给了实时价（见 DOE_BRIDGED_SRC 注释）。
+        # ⚠️ 这种条目的 quantity / order_book 是**桥接交易对**的量，不是本物品的，
+        #    所以只采信价格，qty_ok=False —— 挂出量/求购量不能让它们冒充。
+        if entry["src"] == DOE_BRIDGED_SRC and entry["exchange_volume"] > 0:
+            entry["ok"] = True
+            entry["qty_ok"] = False
+            continue
+        entry["ok"] = False
+        entry["qty_ok"] = False
 
     fetched = _parse_doe_time(str(payload.get("fetched_at") or ""))
     with _DOE_LOCK:
@@ -2262,6 +2340,23 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     # 拿不到任一方时间戳时不拦（保持老行为），免得缺字段反而把 doe 锁死。
     doe_ts = int(doe_source_info(league).get("updated_at") or 0)
     scout_ts = int(scout_source_info(league).get("updated_at") or 0)
+
+    # ★★ scout 太旧就整份停用（见 SCOUT_MAX_AGE_SECONDS 注释）。
+    # 这是「回退守卫」之外的第二道闸：守卫只管 doe→scout 的整体回退，
+    # 而逐条取价那一步是写死的 doe > scout > ninja —— 不在这里把 scout 摘掉，
+    # 停更 22 小时的 scout 照样会把新鲜的 ninja 挡在门外。
+    scout_fresh = True
+    if scout_ts:
+        scout_age = int(time.time()) - scout_ts
+        if scout_age > SCOUT_MAX_AGE_SECONDS:
+            scout_fresh = False
+            log(f"  · poe2scout 的数据已 {scout_age // 3600} 小时没更新"
+                f"（超过 {SCOUT_MAX_AGE_SECONDS // 3600} 小时门槛），"
+                f"本轮不用它取价和挂出量，改用更新鲜的源")
+    if not scout_fresh:
+        scout = {}
+        s_div = s_ch = s_ex = 0.0
+
     fallback_ok = True
     if _primary == "doe":
         # 用户明确指定只用 dadsofexile：即便被判僵也不换源——
@@ -2284,7 +2379,11 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 f"不动不等于坏了）")
     if stale and use_doe_base:
         if fallback_ok:
-            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 poe2scout")
+            # ⚠️ scout 停更被摘掉后，这里实际落到的是 poe.ninja 的系数 ——
+            #    日志必须说 ninja，不然排查时会被"改用 poe2scout"骗去查一个
+            #    本轮根本没参与的数据源（2026-09-29 踩到）。
+            _to = "poe.ninja（poe2scout 已停更，本轮不可用）" if not scout_fresh else "poe2scout"
+            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 {_to}")
             use_doe_base = False
         else:
             log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
@@ -2298,7 +2397,7 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     pair_ask: dict[str, float] = {}
     pair_bid: dict[str, float] = {}
     pair_count: dict[str, int] = {}
-    if PRICE_SOURCE == "scout":
+    if PRICE_SOURCE == "scout" and scout_fresh:
         pair_ask, pair_bid, pair_count = scout_pair_stocks(league)
         # 「立刻填补」：doe 空着或僵住时，缓存里没有就当场强刷一次，
         # 否则这一轮的挂出量会整片落空。
@@ -2308,7 +2407,9 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 log(f"  · scout 交易对快照已当场强刷（{len(pair_ask)} 个通货）")
     # ByCategory 的 CurrentQuantity 语义不明（与全交易对合计对不上），
     # 只在上面全盘拿不到时当最后的兜底用。
-    scout_qty = scout_quantities(league) if not pair_ask else {}
+    # ⚠️ 同样受 scout_fresh 约束：停更 22 小时的 scout 库存不是「本轮的兜底」，
+    #    是旧数据冒充实时量（用户截图里那个一动不动的挂出量就是这么来的）。
+    scout_qty = scout_quantities(league) if (not pair_ask and scout_fresh) else {}
     if use_doe_base:
         f_divine = 1.0
         f_exalted = d_div / d_ex
@@ -2326,15 +2427,17 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         cid = line.get("id", "")
         sparkline = line.get("sparkline") or {}
 
-        # 取价优先级：dadsofexile（挂单够、非假价）> poe2scout > poe.ninja。
+        # 取价优先级：dadsofexile（挂单够 / 桥接价，且非假价）> poe2scout（新鲜时）> poe.ninja。
         # 用谁的价就必须用谁的基准货币，混着算会自相矛盾（这是踩过的坑）。
+        # ⚠️ scout 那一档必须带 scout_fresh：它停更时还留着数据，
+        #    不摘掉就永远挡住更新的 ninja（2026-09-29 事故）。
         doe_row = doe.get(cid)
         price = None
         base_div = base_ch = base_ex = 0.0
         if doe_row and doe_row.get("ok") and use_doe_base:
             price = doe_row["price"]
             base_div, base_ch, base_ex = d_div, d_ch, d_ex
-        elif scout.get(cid) and s_div > 0 and s_ch > 0 and s_ex > 0:
+        elif scout_fresh and scout.get(cid) and s_div > 0 and s_ch > 0 and s_ex > 0:
             price = scout[cid]
             base_div, base_ch, base_ex = s_div, s_ch, s_ex
 
@@ -5382,6 +5485,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload: dict = {
                     "meta": build_meta("exalted", 0, tracked_item_count(STATE["league"])),
                     "items": [],
+                    # 挂出量/求购量是 poe2scout 独占的源，它停更时这两列会整片变「—」。
+                    # 把停更状态带出去，前端才知道该提示「上游停更」而不是「程序坏了」。
+                    "qty": scout_qty_status(STATE["league"]),
                 }
                 self._json(payload)
             elif path == "/api/current":
