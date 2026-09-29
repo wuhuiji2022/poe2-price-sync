@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.7"
+VERSION = "1.27.8"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -1828,11 +1828,15 @@ def invalidate_exclusions() -> None:
 
 
 def tracked_item_count(league: str) -> int:
-    """当前联盟最新一次快照覆盖的通货数量。"""
+    """当前联盟在追踪的通货数量。
+
+    ★ 按通货数（各自最近一行）而不是「最新一轮的行数」——开了
+    skip_unchanged 后最新一轮是稀疏的，按轮数会只剩二三十（v1.27.8 修复）。
+    """
     row = db().execute(
-        "SELECT COUNT(*) AS c FROM snapshot WHERE league = ?"
-        " AND ts = (SELECT MAX(ts) FROM snapshot WHERE league = ?)",
-        (league, league),
+        "SELECT COUNT(DISTINCT currency_id) AS c FROM snapshot"
+        " WHERE league = ? AND (source IS NULL OR source != 'synthetic')",
+        (league,),
     ).fetchone()
     return int(row["c"]) if row else 0
 
@@ -1869,24 +1873,39 @@ def build_spread_snapshot(
         column = BASE_COLUMNS[ref]
         # last_scan 必须按基准分开算。之前不分 ref，一个通货只要被扫过神圣石
         # 就被当成「扫过了」，结果页面默认看的混沌石几乎扫不到数据。
-        targets = [
-            row
-            for row in db().execute(
-                "SELECT s.currency_id, s.value_exalted, s.value_chaos, s.value_divine, s.volume,"
-                " (SELECT MAX(p.ts) FROM spread p"
-                "  WHERE p.league = s.league AND p.currency_id = s.currency_id"
-                "    AND p.ref = ?) AS last_scan"
-                " FROM snapshot s WHERE s.league = ? AND s.ts = ? AND s.currency_id <> ?"
-                " ORDER BY CASE WHEN last_scan IS NULL THEN 0 ELSE 1 END,"
-                "          last_scan ASC, s.volume DESC",
-                (ref, league, latest_ts, ref),
+        # 候选 = 每个通货各自最近一行（不能按最新一轮整轮取：那是稀疏的）。
+        # last_scan 单独查再拼回去——嵌在一条 SQL 里会让 ? 参数的绑定顺序
+        # 变得难以推断，两步走虽然多一次查询，但正确性一目了然。
+        candidates = latest_snapshot_rows(
+            league,
+            ["s.currency_id", "s.value_exalted", "s.value_chaos",
+             "s.value_divine", "s.volume"],
+        )
+        last_scan = {
+            r["currency_id"]: int(r["ts"])
+            for r in db().execute(
+                "SELECT currency_id, MAX(ts) AS ts FROM spread"
+                " WHERE league = ? AND ref = ? GROUP BY currency_id",
+                (league, ref),
             ).fetchall()
-            if row["currency_id"] not in excluded
-            and (
-                force  # 手动「立即扫描」无视重扫间隔
-                or row["last_scan"] is None
-                or int(row["last_scan"]) < fresh_cutoff
-            )
+        }
+        # last_scan 必须按基准分开算。之前不分 ref，一个通货只要被扫过神圣石
+        # 就被当成「扫过了」，结果页面默认看的混沌石几乎扫不到数据。
+        targets = [
+            {**dict(row), "last_scan": last_scan.get(row["currency_id"])}
+            for row in candidates
+            if row["currency_id"] != ref and row["currency_id"] not in excluded
+        ]
+        targets.sort(key=lambda r: (
+            0 if r["last_scan"] is None else 1,
+            r["last_scan"] or 0,
+            -(float(r["volume"] or 0.0)),
+        ))
+        targets = [
+            r for r in targets
+            if force  # 手动「立即扫描」无视重扫间隔
+            or r["last_scan"] is None
+            or r["last_scan"] < fresh_cutoff
         ][:top_n]
 
         for index, row in enumerate(targets, start=1):
@@ -1948,12 +1967,8 @@ def spread_extra_meta(ref: str, covered: int, shown: int) -> dict:
     ).fetchone()
     tracked = 0
     if snap and snap["ts"] is not None:
-        tracked = int(
-            db().execute(
-                "SELECT COUNT(*) AS c FROM snapshot WHERE league = ? AND ts = ?",
-                (STATE["league"], snap["ts"]),
-            ).fetchone()["c"]
-        )
+        # 同 tracked_item_count：按通货数取，不能按最新一轮的行数（那是稀疏的）
+        tracked = tracked_item_count(STATE["league"])
     excluded = excluded_currency_ids()
     return {
         "window_hours": SPREAD_WINDOW_HOURS,
@@ -2846,6 +2861,36 @@ def last_snapshot_values(league: str, before_ts: int) -> dict[str, tuple]:
         for r in rows
         if r["currency_id"]
     }
+
+
+def latest_snapshot_rows(league: str, fields: list[str],
+                         category: str | None = None) -> list:
+    """每个通货「最近一次写进库」的那一行——**跨轮次**取最新，不是「最新一轮」。
+
+    ★ 为什么必须有它（v1.27.8 事故修复）：开了 skip_unchanged 之后，
+    take_snapshot 只写「值变了」的通货，最新一轮天然是稀疏的
+    （实测常只有二三十行，而全量是 649）。所有「当前价」语义的读取
+    （看板 / 倒货榜 / 换算器 / 差价扫描候选）如果还按老约定
+    `ts = MAX(ts)` 整轮取，就只能看到那二三十个通货——
+    2026-09-29 用户实测看板只剩 26 个通货、倒货榜空白，就是这个原因。
+    正确语义：每个通货各自取最近一行（值没变的那部分，最近一行就是当前值）。
+    ⚠️ 排除 synthetic（日线反推点，只用于画图，不能当现价）；
+    cloud 点是云端真实抓取，正常计入。
+    """
+    cols = ", ".join(fields)
+    sql = (
+        f"SELECT {cols} FROM snapshot s"
+        " JOIN (SELECT currency_id, MAX(ts) AS mts FROM snapshot"
+        "       WHERE league = ? AND (source IS NULL OR source != 'synthetic')"
+        "       GROUP BY currency_id) m"
+        "   ON s.currency_id = m.currency_id AND s.ts = m.mts"
+        " WHERE s.league = ?"
+    )
+    params: list = [league, league]
+    if category and category != "all":
+        sql += " AND s.category = ?"
+        params.append(category)
+    return db().execute(sql, params).fetchall()
 
 
 def take_snapshot(league: str) -> tuple[int, int]:
@@ -3755,15 +3800,14 @@ def rows_to_items(base: str, category: str, query: str, hours: int) -> dict:
     latest_ts = int(latest_ts_row["ts"])
     cutoff = latest_ts - hours * 3600
 
-    sql_latest = (
-        "SELECT currency_id, category, value_divine, value_chaos, value_exalted,"
-        " volume, trend, spark FROM snapshot WHERE league = ? AND ts = ?"
+    # ★ 当前值按「每个通货各自最近一行」取，不能按 ts=最新一轮整轮取：
+    #   开了 skip_unchanged 后最新一轮只含值变了的通货（v1.27.8 修复）。
+    latest_rows = latest_snapshot_rows(
+        STATE["league"],
+        ["s.currency_id", "s.category", "s.value_divine", "s.value_chaos",
+         "s.value_exalted", "s.volume", "s.trend", "s.spark"],
+        category,
     )
-    params: list = [STATE["league"], latest_ts]
-    if category and category != "all":
-        sql_latest += " AND category = ?"
-        params.append(category)
-    latest_rows = db().execute(sql_latest, params).fetchall()
 
     sql_series = (
         f"SELECT currency_id, ts, {column} AS value FROM snapshot"
@@ -3891,11 +3935,11 @@ def calc_payload() -> dict:
         return {"meta": build_meta("exalted", 0, 0), "bases": {}, "rates": {}, "items": []}
 
     latest_ts = int(row["ts"])
-    rows = db().execute(
-        "SELECT currency_id, category, value_divine, value_chaos, value_exalted"
-        " FROM snapshot WHERE league = ? AND ts = ?",
-        (STATE["league"], latest_ts),
-    ).fetchall()
+    rows = latest_snapshot_rows(
+        STATE["league"],
+        ["s.currency_id", "s.category", "s.value_divine", "s.value_chaos",
+         "s.value_exalted"],
+    )
     meta_rows = {r["currency_id"]: r for r in db().execute("SELECT * FROM item_meta").fetchall()}
     labels = dict(CATEGORIES)
 
@@ -4594,14 +4638,13 @@ def trade_get(path: str, *, timeout: int = 25, limiter: "TradeLimiter | None" = 
 
 
 def currency_value_map(league: str) -> dict[str, float]:
-    """最新快照里每种通货值多少神圣石，用来把挂单报价统一折算。"""
-    row = db().execute("SELECT MAX(ts) AS ts FROM snapshot WHERE league = ?", (league,)).fetchone()
-    if not row or not row["ts"]:
-        return {}
-    rows = db().execute(
-        "SELECT currency_id, value_divine FROM snapshot WHERE league = ? AND ts = ?",
-        (league, row["ts"]),
-    ).fetchall()
+    """最新快照里每种通货值多少神圣石，用来把挂单报价统一折算。
+
+    ⚠️ v1.27.8：必须按「每个通货各自最近一行」取，不能按 ts = MAX(ts) 整轮取——
+    开了 skip_unchanged 之后整库最新时间戳只属于这一轮真的变了的那些通货，
+    整轮取会漏掉其余 600 多种，挂单折算时它们就没有汇率可用。
+    """
+    rows = latest_snapshot_rows(league, ["s.currency_id", "s.value_divine"])
     out: dict[str, float] = {}
     for r in rows:
         v = r["value_divine"]
@@ -5065,12 +5108,12 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int) -> dict:
         for row in db().execute(sql, [STATE["league"], cutoff]).fetchall()
     }
 
-    latest_rows = db().execute(
-        "SELECT currency_id, category, value_divine, value_chaos, value_exalted,"
-        " volume, COALESCE(stock, 0) AS stock, COALESCE(orders, 0) AS orders"
-        " FROM snapshot WHERE league = ? AND ts = ?",
-        (STATE["league"], latest_ts),
-    ).fetchall()
+    latest_rows = latest_snapshot_rows(
+        STATE["league"],
+        ["s.currency_id", "s.category", "s.value_divine", "s.value_chaos",
+         "s.value_exalted", "s.volume",
+         "COALESCE(s.stock, 0) AS stock", "COALESCE(s.orders, 0) AS orders"],
+    )
     meta_rows = {
         row["currency_id"]: row
         for row in db().execute("SELECT * FROM item_meta").fetchall()
@@ -5084,8 +5127,12 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int) -> dict:
     for row in latest_rows:
         cid = row["currency_id"]
         stat = stats.get(cid)
-        if not stat or stat["n"] < 2:
-            continue  # 历史不足两个采样点，算不出波动空间
+        if not stat:
+            continue  # 窗口内一个采样点都没有，无从谈起
+        # ★ n==1 不再跳过（v1.27.8）：开了 skip_unchanged 后，价格纹丝不动的
+        #   通货在窗口里就只有一行——那恰恰说明它波动为 0，应该以 0% 空间上榜，
+        #   而不是从倒货榜上消失。新入库、真的没历史的通货同样只有 1 点，
+        #   但 confidence（samples/8）会把它们压到低分，语义一致。
         if category and category != "all" and row["category"] != category:
             continue
 
