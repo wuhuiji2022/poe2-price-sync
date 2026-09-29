@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.6"
+VERSION = "1.27.7"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -451,6 +451,45 @@ def _clamp_int(raw, fallback: int, low: int, high: int) -> int:
 PRICE_SOURCE = str(CONFIG.get("price_source") or "scout").strip().lower()
 if PRICE_SOURCE not in ("scout", "ninja"):
     PRICE_SOURCE = "scout"
+
+# ★ 取价主源（可在界面上随时切换，不必改配置文件重启）。
+#
+# 为什么要它：2026-09-29 用户拿游戏内交易所的真值逐条核对过，三个源的准确度
+# 和我们的默认假设**完全相反**：
+#     真值             doe      ninja    scout
+#     1d=535 exalted   +4%      -4%      +1%
+#     1d=8.12 chaos    +36%     +0%      -4%
+#     1c=60.5 exalted  -16%     +5%      +14%
+#     1 annul=279 e    -61%     +20%     +32%
+#   平均绝对偏差       29.2%    7.2%     12.8%
+# → ninja 明显最准，而我们一直在拿最差的 doe 当主源。
+#   但 ninja 只覆盖 52 种通货（scout 有 646），覆盖率差一大截，
+#   所以不能一刀切改默认——**让它可选**，用户按自己在意的是「准」还是「全」来选。
+#
+#   auto  = doe 优先、拿不到再按 price_source 兜底（老行为，覆盖最全）
+#   doe   = 只用 dadsofexile（不回退；它拿不到的通货就没价）
+#   scout = 只用 poe2scout（跳过 doe）
+#   ninja = 只用 poe.ninja（跳过 doe 和 scout，覆盖约 52 种）
+PRIMARY_SOURCE_DEFAULT = str(CONFIG.get("primary_source") or "auto").strip().lower()
+if PRIMARY_SOURCE_DEFAULT not in ("auto", "doe", "scout", "ninja"):
+    PRIMARY_SOURCE_DEFAULT = "auto"
+# 界面上切换后存在这里；None 表示沿用配置文件
+PRIMARY_SOURCE_OVERRIDE: str | None = None
+
+
+def primary_source() -> str:
+    """当前生效的取价主源。"""
+    return PRIMARY_SOURCE_OVERRIDE or PRIMARY_SOURCE_DEFAULT
+
+
+def set_primary_source(value: str) -> str:
+    """切换取价主源，返回实际生效的值（非法输入会被忽略）。"""
+    global PRIMARY_SOURCE_OVERRIDE
+    v = str(value or "").strip().lower()
+    if v not in ("auto", "doe", "scout", "ninja"):
+        return primary_source()
+    PRIMARY_SOURCE_OVERRIDE = v if v != PRIMARY_SOURCE_DEFAULT else None
+    return primary_source()
 
 # 买卖差价榜总开关。关闭时后端不再启动扫描线程，也不会去碰官方交易接口。
 # 官方 trade2 的挂单窗口很小且混着大量低价求购单，算出来的买/卖价和真实成交价对不上，
@@ -2169,6 +2208,16 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         except Exception:  # noqa: BLE001 - doe 是个人小站，挂了不影响主流程
             doe = {}
 
+    # ★ 用户选定的主源：把不该用的那份清掉即可——下面取价时取不到就会自然
+    #   落到 ninja 自带的系数上（见 rows 循环里的 price=None 分支）。
+    #   两份数据仍然照抓（都有缓存，不额外发请求），这样切回 auto 时立刻可用。
+    _primary = primary_source()
+    if _primary == "scout":
+        doe = {}
+    elif _primary == "ninja":
+        doe = {}
+        scout = {}
+
     s_ex = scout.get("exalted") or 1.0
     s_ch = scout.get("chaos") or 0.0
     s_div = scout.get("divine") or 0.0
@@ -2186,13 +2235,46 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     #   stale  = 时间戳太旧（小站干脆不刷新了）
     #   frozen = 时间戳还在动、但价格长时间一个不变（2026-09-28 实测踩到的那种）
     frozen, frozen_age = doe_frozen(league) if doe else (False, 0)
+
+    # ★★ 回退前必须先确认「回退目标确实比现在这个新」——不然那不叫回退，叫倒退。
+    #
+    # 2026-09-29 事故：poe2scout 整条链路停更（ExchangeSnapshot.Epoch 卡在 18 小时前，
+    # 四个端点时间戳完全一致），而 dadsofexile 是实时的（fetched_at 落后 0 分钟）。
+    # 偏偏 doe 用 1287 万成交量算出来的加权价**天然就很稳定**，几小时不动是正常现象，
+    # 于是被「价格指纹僵住」判成僵数据，一纸判决就整体切到停更 18 小时的 scout——
+    # 神圣石汇率当场从 557 掉到 538，然后彻底不动。检测生效了，结果反而更糟。
+    #
+    # 所以：只有 scout 那份数据确实不比 doe 旧，才允许回退。
+    # 拿不到任一方时间戳时不拦（保持老行为），免得缺字段反而把 doe 锁死。
+    doe_ts = int(doe_source_info(league).get("updated_at") or 0)
+    scout_ts = int(scout_source_info(league).get("updated_at") or 0)
+    fallback_ok = True
+    if _primary == "doe":
+        # 用户明确指定只用 dadsofexile：即便被判僵也不换源——
+        # 换源是他自己能在界面上做的决定，程序不该替他改。
+        fallback_ok = False
+    elif doe_ts and scout_ts and scout_ts < doe_ts:
+        fallback_ok = False
+        older = (doe_ts - scout_ts) // 60
+        log(f"  · poe2scout 那份比 dadsofexile 旧 {older} 分钟，"
+            f"本轮不回退（回退只会拿到更老的数据）")
+
     if frozen and use_doe_base:
-        log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过"
-            f"（时间戳还在动，判定为僵数据），本轮改用 poe2scout")
-        use_doe_base = False
+        if fallback_ok:
+            log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过"
+                f"（时间戳还在动，判定为僵数据），本轮改用 poe2scout")
+            use_doe_base = False
+        else:
+            log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过，"
+                f"但备用源更旧，仍沿用 dadsofexile（大成交量加权价本就稳定，"
+                f"不动不等于坏了）")
     if stale and use_doe_base:
-        log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 poe2scout")
-        use_doe_base = False
+        if fallback_ok:
+            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 poe2scout")
+            use_doe_base = False
+        else:
+            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
+                f"但备用源更旧，仍沿用 dadsofexile")
     stale = stale or frozen
 
     # 挂出量 / 求购量改用 poe2scout 的「全交易所交易对快照」，doe 只做兜底。
@@ -2961,6 +3043,277 @@ def sync_from_cloud() -> dict:
     return {"ok": True, "added": len(records), "points": len(targets)}
 
 
+# ------------------------------------------------- 离线空档：用 scout 历史自补
+# 为什么要它：云端补数据靠 GitHub Actions 的 schedule，实测成功率只有 ~23%
+# （14.5 小时该跑 43 次只成 10 次，最大空档 7 小时），用户关机 10 小时回来
+# 云端那头往往也是空的。scout 的通货明细接口自带 36 小时 × 6 小时粒度的历史，
+# 一次请求一个通货就能拿到，用它补空档不受 GitHub 漏跑影响。
+#
+# ⚠️ 粒度只有 6 小时（scout 的快照节奏），补不出 5 分钟粒度；
+#    它的价值是「离线回来一定有东西」，不是「补得更密」。
+# ⚠️ 别拿它的点去跟 doe 的实时价混着算涨跌：6 小时一个点插在本机序列里，
+#    24 小时窗口内会多出几个采样点，这本来就是我们想要的（否则那段是空白），
+#    但它们在库里标着 source='scout'，需要区分时查这个字段即可。
+SCOUT_BACKFILL = bool(CONFIG.get("scout_backfill", True))
+# 本机相邻采样间隔超过这么久才算「有空档需要补」。默认 90 分钟：
+# 比 6 小时粒度小得多，免得每回启动都去打几百个请求。
+SCOUT_BACKFILL_GAP = _clamp_int(
+    CONFIG.get("scout_backfill_gap_minutes", 90), 90, 30, 48 * 60
+) * 60
+# 两次自补之间的最小间隔，默认 6 小时。补一次要打几百个请求，别太勤快。
+SCOUT_BACKFILL_EVERY = _clamp_int(
+    CONFIG.get("scout_backfill_every_minutes", 360), 360, 60, 48 * 60
+) * 60
+SCOUT_BACKFILL_WORKERS = 4
+
+
+def _scout_bulk_history(league: str) -> dict[str, dict[int, float]]:
+    """一次拿全部物品的小时级历史，返回 {api_id: {时间点: 以崇高石计价的价格}}。
+
+    ★ 这个端点（/Leagues/{league}/Items/PriceHistory）比逐个通货去问好太多：
+      · 1 个请求 vs 六百多个请求
+      · **小时级** vs 6 小时级（scout 的 PriceLogs 只有 6 小时一点）
+      · 代价是只给最近 24 小时（逐个问能给 36 小时，但粒度粗 6 倍）
+
+    实测 2026-09-29：返回 829 个物品、每个 24 条小时级记录。
+    拿不到就返回空 dict，调用方退回逐个问的老办法。
+    """
+    # 先把 apiId → ItemId 的映射喂热（scout_currency_prices 顺手就填了，有缓存）
+    try:
+        scout_currency_prices(league)
+    except Exception:                                           # noqa: BLE001
+        pass
+    with _SCOUT_LOCK:
+        id_map = {int(v): k for k, v in (_SCOUT_ITEM_IDS.get(league) or {}).items()
+                  if str(v or "").isdigit()}
+    if not id_map:
+        return {}
+    league_part = urllib.parse.quote(league)
+    try:
+        payload = http_json(
+            f"{SCOUT_API}/{SCOUT_REALM}/Leagues/{league_part}/Items/PriceHistory",
+            retries=2, timeout=60,
+        )
+    except Exception:                                           # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[int, float]] = {}
+    for entry in (payload.get("ItemHistories") or []):
+        if not isinstance(entry, dict):
+            continue
+        api_id = id_map.get(int(entry.get("ItemId") or 0))
+        if not api_id:
+            continue
+        hist: dict[int, float] = {}
+        for e in (entry.get("History") or []):
+            if not isinstance(e, dict):
+                continue
+            stamp = _parse_scout_time(e.get("Time"))
+            try:
+                price = float(e.get("Price"))
+            except (TypeError, ValueError):
+                continue
+            if stamp > 0 and price > 0:
+                hist[int(stamp)] = price
+        if hist:
+            out[api_id] = hist
+    return out
+
+
+def _scout_price_logs(league: str, api_id: str) -> dict[int, float]:
+    """拉一个通货的历史价，返回 {时间点(Unix秒): 以崇高石计价的价格}。
+
+    scout 的 /Currencies/{apiId} 给 7 个点、6 小时一个，价格以联盟基准货币
+    （崇高石）计价——跟 ByCategory 的 CurrentPrice 同一口径，可以直接混用。
+    拿不到就返回空 dict，调用方跳过即可。
+    """
+    league_part = urllib.parse.quote(league)
+    try:
+        payload = http_json(
+            f"{SCOUT_API}/{SCOUT_REALM}/Leagues/{league_part}"
+            f"/Currencies/{urllib.parse.quote(str(api_id))}",
+            retries=1, timeout=20,
+        )
+    except Exception:                                           # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[int, float] = {}
+    for entry in (payload.get("PriceLogs") or []):
+        if not isinstance(entry, dict):
+            continue
+        stamp = _parse_scout_time(entry.get("Time"))
+        try:
+            price = float(entry.get("Price"))
+        except (TypeError, ValueError):
+            continue
+        # scout 的时间戳末尾是 7 位小数，_parse_scout_time 已经截过；解析不了就跳过
+        if stamp > 0 and price > 0:
+            out[int(stamp)] = price
+    return out
+
+
+def backfill_from_scout(league: str | None = None) -> dict:
+    """用 scout 自带的历史把本机采样空档补上。
+
+    优先走批量端点（1 个请求拿到 829 个物品 × 24 个小时级点）；
+    它挂了才退回逐个查询（6 小时粒度、覆盖 36 小时）。
+
+    只在「本机确实有空档」时才动手，且受 SCOUT_BACKFILL_EVERY 节流。
+    返回 {"ok", "added", "points", "reason"}——别只打日志，
+    失败和「无事发生」在日志里长得一样，调用方要能断言。
+    """
+    if not SCOUT_BACKFILL:
+        return {"ok": False, "added": 0, "points": 0, "reason": "scout_backfill 已关闭"}
+    league = league or str(STATE.get("league") or CONFIG.get("league") or "")
+    if not league:
+        return {"ok": False, "added": 0, "points": 0, "reason": "未确定联盟"}
+
+    # 节流：补一次要打几百个请求，别每次启动都来一遍
+    row = db().execute("SELECT v FROM app_meta WHERE k = 'scout_backfill_at'").fetchone()
+    last = int(row["v"]) if row and str(row["v"] or "").isdigit() else 0
+    if last and time.time() - last < SCOUT_BACKFILL_EVERY:
+        return {"ok": False, "added": 0, "points": 0,
+                "reason": f"距上次自补仅 {(time.time() - last) / 60:.0f} 分钟，跳过"}
+
+    # 本机已有的时间点（synthetic 是日线还原点，不算覆盖）
+    have = sorted(
+        int(r["ts"]) for r in db().execute(
+            "SELECT DISTINCT ts FROM snapshot WHERE league = ?"
+            " AND (source IS NULL OR source != 'synthetic')", (league,)
+        ).fetchall()
+    )
+    # 只在最近 48 小时里找空档：更早的数据本来就会被清理
+    floor = int(time.time()) - 48 * 3600
+    recent = [t for t in have if t >= floor]
+    gaps = [
+        (recent[i - 1], recent[i]) for i in range(1, len(recent))
+        if recent[i] - recent[i - 1] > SCOUT_BACKFILL_GAP
+    ]
+    # ⚠️ 这两条「没事可做」的分支**不写**节流时间戳：
+    #    此时只查了本机库和 scout 的两个基准货币（各 1 个请求），代价可以忽略；
+    #    真写了的话，用户联网跑一次（判定无空档）后再关机两小时回来，
+    #    反而会被 6 小时节流挡住——正好是它该起作用的时候。
+    #    节流只用来挡「几百个请求」那次真正的补数据。
+    if not gaps:
+        return {"ok": True, "added": 0, "points": 0, "note": "最近 48 小时没有明显空档"}
+
+    # 基准货币的历史：既是时间网格，也提供每个点的汇率。
+    # 优先批量端点（小时级、1 个请求）；拿不到再退回逐个问（6 小时级）。
+    bulk = _scout_bulk_history(league)
+    if bulk:
+        grid = bulk.get("divine") or {}
+        chaos = bulk.get("chaos") or {}
+        gran = "小时级"
+    else:
+        grid = _scout_price_logs(league, "divine")
+        chaos = _scout_price_logs(league, "chaos")
+        gran = "6 小时级（批量端点不可用）"
+    if not grid:
+        return {"ok": False, "added": 0, "points": 0, "reason": "拿不到 scout 的基准货币历史"}
+
+    # 只补落在空档里、且本机附近确实没有采样的时间点
+    grace = max(_clamp_int(CONFIG.get("interval_minutes", 30), 30, 1, 1440) * 60, 300)
+    import bisect
+
+    targets: list[int] = []
+    for ts in sorted(grid):
+        if not any(a + grace <= ts <= b - grace for a, b in gaps):
+            continue
+        pos = bisect.bisect_left(have, ts)
+        if any(0 <= j < len(have) and abs(have[j] - ts) <= grace for j in (pos - 1, pos)):
+            continue
+        targets.append(ts)
+    if not targets:
+        return {"ok": True, "added": 0, "points": 0,
+                "note": f"{len(gaps)} 段空档里没有可补的 scout 时间点"}
+
+    # 补哪些通货：库里出现过的都补，类别沿用最近一次记录的
+    rows = db().execute(
+        "SELECT currency_id, MAX(category) AS cat FROM snapshot"
+        " WHERE league = ? GROUP BY currency_id", (league,)
+    ).fetchall()
+    wanted = [(r["currency_id"], r["cat"] or "") for r in rows if r["currency_id"]]
+    if not wanted:
+        return {"ok": False, "added": 0, "points": 0, "reason": "库里没有通货可补"}
+
+    # ⚠️ 基准货币必须自己先有价，否则换算无从谈起；拿不到就用 0，下面会跳过该点
+    rates: list[tuple[int, float, float]] = []   # (ts, divine 的 exalted 价, chaos 的 exalted 价)
+    for ts in targets:
+        dex = float(grid.get(ts) or 0.0)
+        cex = float(chaos.get(ts) or 0.0)
+        if dex > 0:
+            rates.append((ts, dex, cex))
+
+    if not rates:
+        return {"ok": False, "added": 0, "points": 0, "reason": "scout 没给基准货币的汇率"}
+
+    def one(item: tuple[str, str]) -> list[tuple]:
+        cid, cat = item
+        logs = bulk.get(cid) if bulk else _scout_price_logs(league, cid)
+        if not logs:
+            return []
+        out: list[tuple] = []
+        for ts, dex, cex in rates:
+            ex = logs.get(ts)
+            if not ex or ex <= 0:
+                continue
+            out.append(
+                (
+                    ts, league, cat, cid,
+                    ex / dex if dex else None,
+                    ex,
+                    ex / cex if cex else None,
+                    0.0, None, "[]", 0.0, 0,
+                    "scout",
+                )
+            )
+        return out
+
+    with ThreadPoolExecutor(max_workers=SCOUT_BACKFILL_WORKERS) as pool:
+        chunks = list(pool.map(one, wanted))
+
+    records = [rec for chunk in chunks for rec in chunk]
+    if records:
+        with db() as connection:
+            connection.executemany(
+                "INSERT OR REPLACE INTO snapshot"
+                " (ts, league, category, currency_id, value_divine, value_exalted,"
+                "  value_chaos, volume, trend, spark, stock, orders, source)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                records,
+            )
+    with db() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO app_meta (k, v) VALUES ('scout_backfill_at', ?)",
+            (int(time.time()),),
+        )
+    log(f"  ✓ scout 历史补入 {len(records)} 条（{len(rates)} 个{gran}点，"
+        f"覆盖 {len(gaps)} 段空档）")
+    return {"ok": True, "added": len(records), "points": len(rates),
+            "gaps": len(gaps), "granularity": gran}
+
+
+class ScoutBackfillWorker(threading.Thread):
+    """启动后跑一次 scout 历史自补。补不动就算了，绝不影响本机抓取。"""
+
+    def __init__(self, league: str) -> None:
+        super().__init__(name="scout-backfill", daemon=True)
+        self.league = league
+
+    def run(self) -> None:
+        try:
+            result = backfill_from_scout(self.league)
+        except Exception as exc:                                # noqa: BLE001
+            log(f"  · scout 历史自补出错（不影响本机抓取）：{exc}")
+            return
+        if not result.get("ok"):
+            reason = result.get("reason") or result.get("note") or ""
+            if reason:
+                log(f"  · scout 历史自补跳过：{reason}")
+
+
 class CloudSyncWorker(threading.Thread):
     """定时拉云端数据补洞。拉不到就跳过，绝不影响本机抓取。"""
 
@@ -3643,17 +3996,122 @@ def build_meta(base: str, latest_ts: int, count: int) -> dict:
     }
 
 
-def query_history(currency_id: str, hours: int) -> dict:
-    """返回某个通货在三种基准下的历史序列，供详情弹窗切换查看。"""
+def _history_from_scout(currency_id: str, hours: int, meta) -> dict:
+    """直接向 poe2scout 要这个通货的历史（小时级，最近 24 小时）。
+
+    批量端点一次就能拿到全部物品；它挂了才退回逐个问（6 小时粒度、36 小时）。
+    价格是 exalted 计价，divine/chaos 用同一时间网格上基准货币的价换算。
+    """
+    league = str(STATE.get("league") or "")
+    cutoff = time.time() - hours * 3600
+    bulk = _scout_bulk_history(league)
+    hist = (bulk.get(currency_id) if bulk else None) or _scout_price_logs(league, currency_id)
+    div = (bulk.get("divine") if bulk else None) or _scout_price_logs(league, "divine")
+    ch = (bulk.get("chaos") if bulk else None) or _scout_price_logs(league, "chaos")
+    gran = "小时级" if bulk else "6 小时级（批量端点不可用）"
+
+    ex_pts, ch_pts, dv_pts = [], [], []
+    for ts in sorted(hist):
+        if ts < cutoff:
+            continue
+        ex = hist[ts]
+        ex_pts.append([ts, ex])
+        if ch.get(ts):
+            ch_pts.append([ts, ex / ch[ts]])
+        if div.get(ts):
+            dv_pts.append([ts, ex / div[ts]])
+    return _history_shell(currency_id, meta, ex_pts, ch_pts, dv_pts, "scout", gran)
+
+
+def _history_from_ninja(currency_id: str, hours: int, meta) -> dict:
+    """从 poe.ninja 的 7 天 sparkline 反推绝对价（日线）。
+
+    ⚠️ ninja 没有绝对值历史端点（exchange/item/currency/temp2 的 history 全是 404），
+    只有 sparkline：data[i] 是「窗口起点到该点」的累计涨跌百分比，
+    最后一个元素等于 totalChange（即整个窗口的总涨跌）。
+    所以：起点价 = 当前价 / (1 + totalChange/100)，再按 data[i] 逐点还原。
+    时间戳没有给，按「每天一点、最后一点是现在」推算——**只能当趋势看**。
+    """
+    league = str(STATE.get("league") or "")
+    cutoff = time.time() - hours * 3600
+    q = urllib.parse.urlencode({"league": league, "type": "Currency"})
+    payload = http_json(f"{NINJA_API}/exchange/current/overview?{q}", retries=2)
+    rates = (payload.get("core") or {}).get("rates") or {}
+    n_ex = float(rates.get("exalted") or 0.0)     # 1 divine = ? exalted
+    n_ch = float(rates.get("chaos") or 0.0)       # 1 divine = ? chaos
+    line = next((l for l in (payload.get("lines") or [])
+                 if l.get("id") == currency_id), None)
+    if not line or not n_ex:
+        return _history_shell(currency_id, meta, [], [], [], "ninja", "无数据")
+
+    pv = float(line.get("primaryValue") or 0.0)   # 当前价，divine 计价
+    spark = line.get("sparkline") or {}
+    data = spark.get("data") or []
+    total = float(spark.get("totalChange") or 0.0)
+    n = len(data)
+    start = pv / (1 + total / 100.0) if total > -100 else pv
+
+    ex_pts, ch_pts, dv_pts = [], [], []
+    now = time.time()
+    for i, d in enumerate(data):
+        ts = int(now - (n - 1 - i) * 86400)
+        if ts < cutoff:
+            continue
+        try:
+            v = start * (1 + float(d) / 100.0)
+        except (TypeError, ValueError):
+            continue
+        dv_pts.append([ts, v])
+        ex_pts.append([ts, v * n_ex])
+        if n_ch:
+            ch_pts.append([ts, v * n_ch])
+    return _history_shell(currency_id, meta, ex_pts, ch_pts, dv_pts, "ninja", "日线（7 天）")
+
+
+def _history_shell(currency_id, meta, ex_pts, ch_pts, dv_pts, src, gran) -> dict:
+    return {
+        "id": currency_id,
+        "name": zh_display_name(currency_id, meta) or (
+            meta["name_en"] if meta and meta["name_en"] else currency_id
+        ),
+        "name_zh": zh_display_name(currency_id, meta),
+        "name_en": meta["name_en"] if meta and meta["name_en"] else currency_id,
+        "points": {"exalted": ex_pts, "chaos": ch_pts, "divine": dv_pts},
+        "src": src,
+        "granularity": gran,
+        "synthetic_points": 0,
+    }
+
+
+def query_history(currency_id: str, hours: int, src: str = "db") -> dict:
+    """返回某个通货在三种基准下的历史序列，供详情弹窗切换查看。
+
+    src:
+      db    = 本机记录（默认；本机 5 分钟一采，覆盖 646 种通货）
+      scout = 直接问 poe2scout 要（小时级，最近 24 小时）
+      ninja = 从 poe.ninja 的 7 天 sparkline 反推（日线）
+    """
+    meta = db().execute(
+        "SELECT * FROM item_meta WHERE currency_id = ?", (currency_id,)
+    ).fetchone()
+    src = str(src or "db").strip().lower()
+    if src == "scout":
+        try:
+            return _history_from_scout(currency_id, hours, meta)
+        except Exception as exc:                                # noqa: BLE001
+            log(f"  · 取 poe2scout 历史失败（{exc}），退回本机记录")
+    elif src == "ninja":
+        try:
+            return _history_from_ninja(currency_id, hours, meta)
+        except Exception as exc:                                # noqa: BLE001
+            log(f"  · 取 poe.ninja 历史失败（{exc}），退回本机记录")
+
     cutoff = int(time.time()) - hours * 3600
     rows = db().execute(
         "SELECT ts, value_exalted, value_chaos, value_divine, source FROM snapshot"
         " WHERE league = ? AND currency_id = ? AND ts >= ? ORDER BY ts ASC",
         (STATE["league"], currency_id, cutoff),
     ).fetchall()
-    meta = db().execute(
-        "SELECT * FROM item_meta WHERE currency_id = ?", (currency_id,)
-    ).fetchone()
 
     def series(column: str) -> list[list[float]]:
         out: list[list[float]] = []
@@ -3664,20 +4122,13 @@ def query_history(currency_id: str, hours: int) -> dict:
             out.append([row["ts"], value])
         return out
 
-    return {
-        "id": currency_id,
-        "name": zh_display_name(currency_id, meta) or (
-            meta["name_en"] if meta and meta["name_en"] else currency_id
-        ),
-        "name_zh": zh_display_name(currency_id, meta),
-        "name_en": meta["name_en"] if meta and meta["name_en"] else currency_id,
-        "points": {
-            "exalted": series("value_exalted"),
-            "chaos": series("value_chaos"),
-            "divine": series("value_divine"),
-        },
-        "synthetic_points": sum(1 for row in rows if row["source"] == "synthetic"),
-    }
+    result = _history_shell(
+        currency_id, meta,
+        series("value_exalted"), series("value_chaos"), series("value_divine"),
+        "db", f"本机记录（{INTERVAL_SECONDS // 60} 分钟一采）",
+    )
+    result["synthetic_points"] = sum(1 for row in rows if row["source"] == "synthetic")
+    return result
 
 
 # ------------------------------------------------------------------- 暗金榜
@@ -4906,6 +5357,22 @@ class Handler(BaseHTTPRequestHandler):
     server_version = APP_NAME
     protocol_version = "HTTP/1.1"
 
+    # 界面上只有「切换取价源」这一个写操作，所以 POST 就只认 /api/source。
+    # 其余路径一律 405，别让 do_POST 变成第二个入口——
+    # 两套路由迟早漂成两份不一致的行为。
+    def do_POST(self) -> None:  # noqa: N802 - HTTP 约定
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/source":
+            self._json({"error": "该接口不支持 POST"}, status=405)
+            return
+        try:
+            body = self._read_json_body()
+            value = str((body or {}).get("source") or "").strip().lower()
+            self._json({"ok": True, "source": set_primary_source(value)})
+        except Exception as exc:                                # noqa: BLE001
+            log(f"接口异常 {parsed.path}: {exc}")
+            self._json({"error": str(exc)}, status=500)
+
     def do_GET(self) -> None:  # noqa: N802 - HTTP 约定
         parsed = urllib.parse.urlparse(self.path)
         path, args = parsed.path, urllib.parse.parse_qs(parsed.query)
@@ -4962,7 +5429,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(calc_payload())
             elif path == "/api/history":
                 hours = _safe_int(args.get("hours", ["72"])[0], 72, 1, 24 * RETENTION_DAYS)
-                self._json(query_history(args.get("id", [""])[0], hours))
+                self._json(query_history(
+                    args.get("id", [""])[0], hours,
+                    args.get("src", ["db"])[0],
+                ))
             elif path.startswith("/api/uniques"):
                 if path == "/api/uniques/history":
                     hours = _safe_int(
@@ -5017,6 +5487,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "league": league})
                 else:
                     self._json({"ok": False, "league": STATE["league"]}, status=400)
+            elif path == "/api/source":
+                # 取价主源。切换走 POST（见 do_POST），这里只负责告诉前端有哪些可选。
+                self._json({
+                    "source": primary_source(),
+                    "default": PRIMARY_SOURCE_DEFAULT,
+                    "options": [
+                        {"value": "auto", "label": "自动（doe 优先，覆盖最全）"},
+                        {"value": "doe", "label": "dadsofexile"},
+                        {"value": "scout", "label": "poe2scout"},
+                        {"value": "ninja", "label": "poe.ninja（最准，约 52 种）"},
+                    ],
+                })
             elif path == "/api/leagues":
                 self._json({"leagues": STATE["leagues"], "current": STATE["league"]})
             elif path == "/api/config":
@@ -5044,6 +5526,21 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._respond(status, "application/json; charset=utf-8", body)
+
+    def _read_json_body(self) -> dict:
+        """读 POST 的 JSON 体。读不出来就返回空 dict，调用方按缺省处理。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return {}
+        if length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8", "replace")
+            data = json.loads(raw)
+        except Exception:                                       # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _binary(self, status: int, body: bytes) -> None:
         # 图标一旦缓存到本地就不会再变，直接给 7 天长缓存
@@ -5456,6 +5953,11 @@ def main() -> None:
         #    容易让人以为云端抓取频率被改了，所以这里必须点明是本机拉取间隔。
         log(f"云端补数据已启用（本机每 {CLOUD_SYNC_INTERVAL // 60} 分钟拉一次云端数据；"
             f"云端抓取由 GitHub Actions 定时执行）")
+
+    # scout 历史自补：不依赖 GitHub Actions，直接向 scout 要 6 小时粒度的历史。
+    # 云端那头实测只有 ~23% 的跑成率，这个兜底保证「离线回来一定补得到东西」。
+    if SCOUT_BACKFILL:
+        ScoutBackfillWorker(str(STATE.get("league") or CONFIG.get("league") or "")).start()
 
     server, port = bind_server()
     server.worker = worker  # type: ignore[attr-defined] - 供 HTTP handler 调用切换联盟
