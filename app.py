@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.9"
+VERSION = "1.27.10"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -165,6 +165,14 @@ DEFAULT_CONFIG: dict = {
     # ⚠️ 别设太短：doe 正常就是 40~100 分钟才整体刷新一次，
     #    设成 45 分钟会在它正常待着的时候误判、来回切源把价格抖出 10% 的台阶。
     "doe_frozen_seconds": 9000,  # 2.5 小时
+    # ★ 三个源的请求间隔是分开的（秒），别合成一个：
+    #   dadsofexile 约 10 分钟重算 → 4 分钟取一次，跟得上
+    #   poe.ninja   实测 6~82 分钟刷一次 → 1 小时取一次（原来每轮每类别都打，太浪费）
+    #   poe2scout   6 小时一聚 → 30 分钟取一次
+    # 缓存时长必须短于源自己的刷新周期，否则会把「源还没刷」误当成「源不动」。
+    "ninja_ttl_seconds": 3600,   # 1 小时
+    # poe.ninja 的汇率指纹连续这么久没变，就判它也不动了（它响应里没有时间戳）
+    "ninja_frozen_seconds": 21600,  # 6 小时
     "spread_refs": ["chaos"],    # 自动扫描用哪些基准货币（与页面差价榜默认基准保持一致）
     "spread_window_hours": 24,   # 榜单展示窗口：多久之内扫到的挂单仍然展示
     "spread_rescan_minutes": 360, # 同一个通货隔多久才重新扫一次（配额有限，别调太小）
@@ -711,6 +719,62 @@ def http_json(url: str, *, retries: int = 3, timeout: int = 30):
 # 既避开 6 小时的盲区，也不至于白白去打第三方接口。
 SCOUT_TTL_SECONDS = 30 * 60
 
+# ★★ 三个源的请求间隔是**分开**的，别混成一个值
+#
+# 原先只有 dadsofexile / poe2scout 各带一个缓存时长，poe.ninja 是
+# **每轮每个类别都现打一次**——一轮 14 个类别、5 分钟一轮，等于一天打它 4000 次，
+# 而它自己其实是小时级刷新（实测 6~82 分钟），绝大多数请求拿回的是同一份数据。
+#
+#   dadsofexile  DOE_TTL_SECONDS   =   4 分钟  —— 它约 10 分钟重算一次，要跟得上
+#   poe.ninja    NINJA_TTL_SECONDS =  60 分钟  —— 实测 6~82 分钟刷一次，按 1 小时取
+#   poe2scout    SCOUT_TTL_SECONDS =  30 分钟  —— 它 6 小时一聚，30 分钟够避开盲区
+#
+# ⚠️ 缓存时长必须**短于**源自己的刷新周期，否则会把「源还没刷」误当成「源不动」，
+#    一直拿上一份快照当新的用；但也不能远短于它，否则只是白白打接口。
+NINJA_TTL_SECONDS = _clamp_int(
+    CONFIG.get("ninja_ttl_seconds", 60 * 60), 60 * 60, 5 * 60, 6 * 3600
+)
+
+_NINJA_CACHE: dict[str, tuple[float, dict]] = {}
+_NINJA_CACHE_LOCK = threading.RLock()
+
+
+def ninja_cached(url: str, *, force: bool = False) -> dict:
+    """带缓存地取一个 poe.ninja 端点（默认 1 小时才真的发一次请求）。
+
+    ⚠️ 请求失败时**优先退回旧缓存**而不是抛出去：ninja 偶尔抖一下不该让整轮
+       没数据，旧一份也比没有强（它本来就是小时级）。真的没缓存时才 raise。
+    """
+    now = time.time()
+    with _NINJA_CACHE_LOCK:
+        cached = _NINJA_CACHE.get(url)
+        if cached and not force and now - cached[0] < NINJA_TTL_SECONDS:
+            return cached[1]
+    try:
+        payload = http_json(url)
+    except Exception:                                              # noqa: BLE001
+        with _NINJA_CACHE_LOCK:
+            old = _NINJA_CACHE.get(url)
+        if old:
+            log_once(f"ninja-cache-fallback:{url}",
+                     f"  · poe.ninja 本次请求失败，沿用 {int(now - old[0]) // 60} "
+                     f"分钟前的缓存")
+            return old[1]
+        raise
+    if isinstance(payload, dict):
+        with _NINJA_CACHE_LOCK:
+            _NINJA_CACHE[url] = (now, payload)
+    return payload
+
+
+def source_intervals() -> dict[str, int]:
+    """三个源各自的请求间隔（秒）。它们是分开配置的，调用方别当成一个值用。"""
+    return {
+        "dadsofexile": DOE_TTL_SECONDS,
+        "poe.ninja": NINJA_TTL_SECONDS,
+        "poe2scout": SCOUT_TTL_SECONDS,
+    }
+
 # ★★ scout 数据的最大可采信年龄。
 #
 # 2026-09-29 事故：poe2scout 整站停更（ExchangeSnapshot 卡在 09-28 08:00，22 小时没动），
@@ -990,6 +1054,50 @@ def scout_qty_status(league: str) -> dict:
         "ok": fresh,
         "stale_hours": round(age / 3600, 1),
         "reason": "" if fresh else f"挂出量来源 poe2scout 已 {age // 3600} 小时没更新，暂时无法提供实时挂单量",
+    }
+
+
+# 本轮实际生效的取价基准源（在 fetch_category 里写，接口读）。
+# 为什么要记：界面上得能说清「现在这个价是谁给的、它多久没动了」——
+# 否则用户看到一条直线，分不清是市场没动、还是源僵了、还是程序坏了。
+_LAST_BASIS: dict[str, str] = {}
+
+
+def price_status(league: str) -> dict:
+    """当前取价基准源的健康状况：它是谁、它的价多久没变过。
+
+    跟 `scout_qty_status()` 一个套路——把「上游不动了」明确说出来。
+    ⚠️ 判据一律用**数据本身变没变**（价格指纹 / 汇率指纹），
+       不看源自报的时间戳：dadsofexile 会「时间戳在动、价格不动」，
+       poe.ninja 干脆不带时间戳。
+    """
+    basis = str(_LAST_BASIS.get(league) or "")
+    if basis == "doe":
+        _frozen, held = doe_frozen(league)
+        label = "dadsofexile"
+    elif basis == "ninja":
+        _frozen, held = ninja_frozen(league)
+        label = "poe.ninja"
+    elif basis == "scout":
+        try:
+            ts = int(scout_source_info(league).get("updated_at") or 0)
+        except Exception:  # noqa: BLE001
+            ts = 0
+        held = max(int(time.time()) - ts, 0) if ts else 0
+        label = "poe2scout"
+    else:
+        return {"ok": True, "basis": "", "held_minutes": 0, "reason": ""}
+
+    held_min = held // 60
+    if held_min < 60:
+        return {"ok": True, "basis": basis, "held_minutes": held_min, "reason": ""}
+    hours = held_min // 60
+    return {
+        "ok": False,
+        "basis": basis,
+        "held_minutes": held_min,
+        "reason": f"当前取价源 {label} 的价格已 {hours} 小时没有变化，"
+                  f"显示的可能是 {hours} 小时前的行情",
     }
 
 
@@ -1399,6 +1507,101 @@ def doe_frozen(league: str) -> tuple[bool, int]:
     _fp, first_seen = entry
     held = int(time.time() - first_seen)
     return held >= DOE_FROZEN_SECONDS, max(held, 0)
+
+
+# --------------------------------------------------------------------------
+# poe.ninja 的「活跃度」判据
+#
+# 2026-09-29 的死结逼出这套东西：
+#   · poe2scout 全站停更 24.7 小时（三个活跃联盟的 Epoch 全卡在同一时刻）
+#   · dadsofexile 价格僵住 23 小时（divine 汇率死在 482.92，
+#     比用户游戏内核对过的真值 535 低 9.7%）
+#   · 唯一还可能活着的是 poe.ninja —— 但「回退守卫」fallback_ok 是拿
+#     **scout 的时间戳**去比 doe 的，scout 停更后它永远更旧
+#     → 永远判「备用源更旧」→ 永不回退 → 程序被锁死在那份差 9.7% 的僵数据上。
+#
+# 所以 scout 停更时，守卫该问的是「ninja 活着吗」，不是「scout 新不新」。
+# ninja 的响应**不带时间戳**（实测确认，core 里只有 rates/primary），
+# 只能跟 doe 一样看数据本身变没变：对 core.rates 算指纹，长时间不变就判它也不动了。
+# --------------------------------------------------------------------------
+_NINJA_FP: dict[str, tuple[str, float]] = {}   # 联盟 -> (汇率指纹, 首次见到该指纹的时刻)
+_NINJA_FP_LOCK = threading.Lock()
+_NINJA_STATE_FILE = DATA_DIR / "ninja_freshness.json"
+_NINJA_STATE_LOADED = False
+
+# ninja 是小时级刷新（实测 6~82 分钟），阈值必须明显大于它，
+# 否则它正常待着就被误判成不动。默认 6 小时。
+NINJA_FROZEN_SECONDS = _clamp_int(
+    CONFIG.get("ninja_frozen_seconds", 6 * 3600), 6 * 3600, 3600, 48 * 3600
+)
+
+
+def _ninja_state_load() -> None:
+    global _NINJA_STATE_LOADED
+    if _NINJA_STATE_LOADED:
+        return
+    _NINJA_STATE_LOADED = True
+    try:
+        with open(_NINJA_STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    for league, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        fp = str(entry.get("fp") or "")
+        seen = float(entry.get("seen") or 0)
+        if fp and 0 < seen <= now:
+            _NINJA_FP[str(league)] = (fp, seen)
+
+
+def _ninja_state_save() -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {lg: {"fp": fp, "seen": seen} for lg, (fp, seen) in _NINJA_FP.items()}
+        tmp = Path(f"{_NINJA_STATE_FILE}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, _NINJA_STATE_FILE)
+    except OSError:
+        pass
+
+
+def ninja_note_rates(league: str, rates: dict) -> None:
+    """每次拿到 poe.ninja 的汇率就记一笔指纹：汇率变了才算它刷新过。"""
+    if not rates:
+        return
+    try:
+        fp = _doe_hash_prices({str(k): float(v) for k, v in rates.items()})
+    except (TypeError, ValueError):
+        return
+    if not fp:
+        return
+    now = time.time()
+    with _NINJA_FP_LOCK:
+        _ninja_state_load()
+        prev = _NINJA_FP.get(league)
+        if prev is None or prev[0] != fp:
+            _NINJA_FP[league] = (fp, now)
+            _ninja_state_save()
+
+
+def ninja_frozen(league: str) -> tuple[bool, int]:
+    """poe.ninja 的汇率是不是也僵住了：返回 (是否僵住, 已僵多久/秒)。
+
+    没有历史时返回 False —— 刚启动不该用它去拦回退，
+    那会把「还不知道 ninja 死没死」误当成「ninja 也没动」。
+    """
+    with _NINJA_FP_LOCK:
+        _ninja_state_load()
+        entry = _NINJA_FP.get(league)
+    if not entry:
+        return False, 0
+    held = int(time.time() - entry[1])
+    return held >= NINJA_FROZEN_SECONDS, max(held, 0)
 
 
 def pick_ask_bid(
@@ -2268,7 +2471,8 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         f"{NINJA_API}/exchange/current/overview"
         f"?league={urllib.parse.quote(league)}&type={urllib.parse.quote(category)}"
     )
-    payload = http_json(url)
+    # ★ poe.ninja 是小时级刷新，按 1 小时缓存一次（见 NINJA_TTL_SECONDS 注释）
+    payload = ninja_cached(url)
 
     core = payload.get("core") or {}
     rates: dict[str, float] = core.get("rates") or {}
@@ -2282,6 +2486,14 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         return 1.0 if primary == name else float("nan")
 
     f_exalted, f_chaos, f_divine = factor("exalted"), factor("chaos"), factor("divine")
+    # 记一笔 ninja 汇率指纹：它响应里没有时间戳，判断它活不活跃只能看数据变没变
+    ninja_note_rates(league, rates)
+    # ⚠️ ninja 没给汇率时 factor() 会返回 nan（自检里用假联盟就复现了），
+    #    而 nan 会顺着「价格 × 系数」把每一行全污染成 nan。
+    #    所以先判一次：系数不可用 == 这份 ninja 数据不可用，不许拿它当回退目标。
+    ninja_rates_ok = all(
+        math.isfinite(x) and x > 0 for x in (f_exalted, f_chaos, f_divine)
+    )
 
     # poe2scout 覆盖时用它的汇率换算。它以「崇高石 = 1」计价，
     # 折算成 divine 基准的系数：1 divine = (divine价/exalted价) 崇高 = (divine价/chaos价) 混沌。
@@ -2338,6 +2550,14 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     #
     # 所以：只有 scout 那份数据确实不比 doe 旧，才允许回退。
     # 拿不到任一方时间戳时不拦（保持老行为），免得缺字段反而把 doe 锁死。
+    #
+    # ★★ 但这条守卫有个前提：**回退目标是 scout**。
+    #    2026-09-29 实测踩到的死结：scout 全站停更 24.7 小时后被上面摘掉，
+    #    回退目标实际变成了 poe.ninja，守卫却还在拿 scout 的时间戳跟 doe 比——
+    #    scout 停更 24h，比谁都旧，于是永远判「备用源更旧」→ 永不回退。
+    #    后果是 doe 的 divine 汇率卡在 482.92 整整 23 小时（比真值 535 低 9.7%），
+    #    程序却一直把它当实时价用。
+    #    → scout 已被摘掉时，该问的是「ninja 活着吗」，不是「scout 新不新」。
     doe_ts = int(doe_source_info(league).get("updated_at") or 0)
     scout_ts = int(scout_source_info(league).get("updated_at") or 0)
 
@@ -2350,9 +2570,12 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         scout_age = int(time.time()) - scout_ts
         if scout_age > SCOUT_MAX_AGE_SECONDS:
             scout_fresh = False
-            log(f"  · poe2scout 的数据已 {scout_age // 3600} 小时没更新"
+            log_once(
+                f"scout-stale:{league}",
+                f"  · poe2scout 的数据已 {scout_age // 3600} 小时没更新"
                 f"（超过 {SCOUT_MAX_AGE_SECONDS // 3600} 小时门槛），"
-                f"本轮不用它取价和挂出量，改用更新鲜的源")
+                f"本轮不用它取价和挂出量，改用更新鲜的源",
+            )
     if not scout_fresh:
         scout = {}
         s_div = s_ch = s_ex = 0.0
@@ -2362,33 +2585,69 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         # 用户明确指定只用 dadsofexile：即便被判僵也不换源——
         # 换源是他自己能在界面上做的决定，程序不该替他改。
         fallback_ok = False
+    elif not scout_fresh:
+        # ★ scout 已停更被摘掉 → 回退目标是 poe.ninja，守卫必须换成问 ninja。
+        #   这里**不会**来回横跳：判据是「doe 的价格指纹多久没变」，
+        #   只要 doe 一直不动就一直回退，只有 doe 真的刷新了才会切回去。
+        n_frozen, n_held = ninja_frozen(league)
+        if n_frozen:
+            fallback_ok = False
+            log_once(
+                f"ninja-frozen:{league}",
+                f"  · poe.ninja 的汇率也已 {n_held // 60} 分钟没变过，"
+                f"回退也拿不到更新的数据，本轮仍沿用 dadsofexile",
+            )
+        elif not ninja_rates_ok:
+            fallback_ok = False
+            log_once(
+                f"ninja-norates:{league}",
+                "  · poe.ninja 本轮没给汇率，无法用它的价，本轮仍沿用 dadsofexile",
+            )
     elif doe_ts and scout_ts and scout_ts < doe_ts:
         fallback_ok = False
         older = (doe_ts - scout_ts) // 60
-        log(f"  · poe2scout 那份比 dadsofexile 旧 {older} 分钟，"
-            f"本轮不回退（回退只会拿到更老的数据）")
+        log_once(
+            f"scout-older:{league}",
+            f"  · poe2scout 那份比 dadsofexile 旧 {older} 分钟，"
+            f"本轮不回退（回退只会拿到更老的数据）",
+        )
 
     if frozen and use_doe_base:
         if fallback_ok:
-            log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过"
-                f"（时间戳还在动，判定为僵数据），本轮改用 poe2scout")
+            _to = "poe.ninja（poe2scout 已停更，本轮不可用）" if not scout_fresh else "poe2scout"
+            log_once(
+                f"doe-frozen:{league}",
+                f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过"
+                f"（时间戳还在动，判定为僵数据），本轮改用 {_to}",
+            )
             use_doe_base = False
         else:
-            log(f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过，"
-                f"但备用源更旧，仍沿用 dadsofexile（大成交量加权价本就稳定，"
-                f"不动不等于坏了）")
+            log_once(
+                f"doe-frozen-keep:{league}",
+                f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过，"
+                f"但备用源也不动，仍沿用 dadsofexile",
+            )
     if stale and use_doe_base:
         if fallback_ok:
             # ⚠️ scout 停更被摘掉后，这里实际落到的是 poe.ninja 的系数 ——
             #    日志必须说 ninja，不然排查时会被"改用 poe2scout"骗去查一个
             #    本轮根本没参与的数据源（2026-09-29 踩到）。
             _to = "poe.ninja（poe2scout 已停更，本轮不可用）" if not scout_fresh else "poe2scout"
-            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 {_to}")
+            log_once(
+                f"doe-stale:{league}",
+                f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，本轮改用 {_to}",
+            )
             use_doe_base = False
         else:
-            log(f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
-                f"但备用源更旧，仍沿用 dadsofexile")
+            log_once(
+                f"doe-stale-keep:{league}",
+                f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
+                f"但备用源更旧，仍沿用 dadsofexile",
+            )
     stale = stale or frozen
+
+    # 记下本轮真正用上的基准源，供 /api/meta 告诉界面「现在这个价是谁给的」
+    _LAST_BASIS[league] = "doe" if use_doe_base else ("scout" if scout else "ninja")
 
     # 挂出量 / 求购量改用 poe2scout 的「全交易所交易对快照」，doe 只做兜底。
     # ⚠️ 旧口径只查「对崇高石」那一个交易对、且只取自己那一侧，
@@ -2547,7 +2806,8 @@ def fetch_unique_category(league: str, category: str) -> list[dict]:
         f"{NINJA_API}/stash/current/item/overview"
         f"?league={urllib.parse.quote(league)}&type={urllib.parse.quote(category)}"
     )
-    payload = http_json(url)
+    # 同上：poe.ninja 按 1 小时缓存一次，别每轮每个分类都去打它
+    payload = ninja_cached(url)
 
     core = payload.get("core") or {}
     rates: dict[str, float] = core.get("rates") or {}
@@ -3630,6 +3890,27 @@ def _prune_logs() -> None:
                 pass
     except Exception:  # noqa: BLE001
         pass
+
+
+_LOG_THROTTLE: dict[str, float] = {}
+_LOG_THROTTLE_LOCK = threading.Lock()
+
+
+def log_once(key: str, message: str, every: float = 1800.0) -> None:
+    """同一件事按 key 节流后再写日志。
+
+    `fetch_category` 是**按类别**跑的（一轮 14 次），而「源站停更」这类提示描述的是
+    整轮共用的一个状态 —— 不打招呼就会重复 14 遍，把真正的关键行淹掉
+    （2026-09-29 实测：一轮 90 行日志里 60 行都是同一句「poe2scout 已停更」，
+    后面「644 个价格无变化」这种关键行得翻很久才找得到）。
+    """
+    now = time.time()
+    with _LOG_THROTTLE_LOCK:
+        last = _LOG_THROTTLE.get(key, 0.0)
+        if now - last < every:
+            return
+        _LOG_THROTTLE[key] = now
+    log(message)
 
 
 def log(message: str) -> None:
@@ -5488,6 +5769,10 @@ class Handler(BaseHTTPRequestHandler):
                     # 挂出量/求购量是 poe2scout 独占的源，它停更时这两列会整片变「—」。
                     # 把停更状态带出去，前端才知道该提示「上游停更」而不是「程序坏了」。
                     "qty": scout_qty_status(STATE["league"]),
+                    # 当前取价源是谁、它的价多久没动过（供顶部横幅提示）
+                    "price": price_status(STATE["league"]),
+                    # 三个源各自的请求间隔（秒）——它们是分开的，前端别当成一个值展示
+                    "sources": source_intervals(),
                 }
                 self._json(payload)
             elif path == "/api/current":
