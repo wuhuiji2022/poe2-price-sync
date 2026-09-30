@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.10"
+VERSION = "1.27.11"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -165,6 +165,7 @@ DEFAULT_CONFIG: dict = {
     # ⚠️ 别设太短：doe 正常就是 40~100 分钟才整体刷新一次，
     #    设成 45 分钟会在它正常待着的时候误判、来回切源把价格抖出 10% 的台阶。
     "doe_frozen_seconds": 9000,  # 2.5 小时
+    "doe_rates_frozen_seconds": 21600,  # 6 小时：基准汇率单独判僵的门槛（v1.27.11）
     # ★ 三个源的请求间隔是分开的（秒），别合成一个：
     #   dadsofexile 约 10 分钟重算 → 4 分钟取一次，跟得上
     #   poe.ninja   实测 6~82 分钟刷一次 → 1 小时取一次（原来每轮每类别都打，太浪费）
@@ -1073,7 +1074,12 @@ def price_status(league: str) -> dict:
     """
     basis = str(_LAST_BASIS.get(league) or "")
     if basis == "doe":
-        _frozen, held = doe_frozen(league)
+        # 两道判据取「任一判僵」：整体价格指纹会被其它通货的变动掩盖，
+        # 汇率这把尺子得单独看（v1.27.11）。显示给用户的时长取较大的那个。
+        f_price, h_price = doe_frozen(league)
+        f_rate, h_rate = doe_rates_frozen(league)
+        _frozen = bool(f_price or f_rate)
+        held = max(h_price, h_rate)
         label = "dadsofexile"
     elif basis == "ninja":
         _frozen, held = ninja_frozen(league)
@@ -1096,7 +1102,7 @@ def price_status(league: str) -> dict:
         "ok": False,
         "basis": basis,
         "held_minutes": held_min,
-        "reason": f"当前取价源 {label} 的价格已 {hours} 小时没有变化，"
+        "reason": f"当前取价源 {label} 的价格/汇率已 {hours} 小时没有变化，"
                   f"显示的可能是 {hours} 小时前的行情",
     }
 
@@ -1507,6 +1513,102 @@ def doe_frozen(league: str) -> tuple[bool, int]:
     _fp, first_seen = entry
     held = int(time.time() - first_seen)
     return held >= DOE_FROZEN_SECONDS, max(held, 0)
+
+
+# --------------------------------------------------------------------------
+# 「僵住」的第三道判据：基准汇率**单独**算指纹（v1.27.11）
+#
+# ★ 2026-09-30 补的缺口。上面 doe_frozen 看的是**整体价格指纹**，只要 646 个
+#   通货里有零星几个在动，指纹就变 → 不判僵 → 不回退。可这次事故的真实形态
+#   恰恰是「基准汇率钉死、其它通货照常在动」：
+#     · 09-28 15:27 起 doe 的 divine 汇率 482.92 一连 23 小时不动，
+#       而同一时段其它通货在更新 → 全局价格指纹一直在变 → doe_frozen 永远 False。
+#     · v1.27.10 发出后本机 real 行切到了 ninja（514.4 / 517.6）看似修好了，
+#       但云端三轮 cloud 行仍是 482.92 —— 云端那几轮整体价格没僵，就没回退。
+#
+#   汇率是**尺子**：尺子错了，逐条价格再新也是按错尺子折出来的。
+#   所以这三个数必须单独判，不能混在全局指纹里被其它通货的变动掩盖掉。
+# --------------------------------------------------------------------------
+_DOE_RATES_FP: dict[str, tuple[str, float]] = {}  # 联盟 -> (汇率指纹, 首次见到该指纹的时刻)
+_DOE_RATES_LOCK = threading.Lock()
+_DOE_RATES_STATE_FILE = DATA_DIR / "doe_rates_freshness.json"
+_DOE_RATES_LOADED = False
+
+# 汇率天生比单品价格稳定（它是全市场加权成交价），阈值要比 DOE_FROZEN_SECONDS 长，
+# 否则正常待着就被误判。实测它僵住时是几十小时一动不动，默认 6 小时。
+DOE_RATES_FROZEN_SECONDS = _clamp_int(
+    CONFIG.get("doe_rates_frozen_seconds", 6 * 3600), 6 * 3600, 2 * 3600, 24 * 3600
+)
+
+
+def _doe_rates_load() -> None:
+    global _DOE_RATES_LOADED
+    if _DOE_RATES_LOADED:
+        return
+    _DOE_RATES_LOADED = True
+    try:
+        with open(_DOE_RATES_STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    for league, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        fp = str(entry.get("fp") or "")
+        seen = float(entry.get("seen") or 0)
+        if fp and 0 < seen <= now:
+            _DOE_RATES_FP[str(league)] = (fp, seen)
+
+
+def _doe_rates_save() -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {lg: {"fp": fp, "seen": seen}
+                   for lg, (fp, seen) in _DOE_RATES_FP.items()}
+        tmp = Path(f"{_DOE_RATES_STATE_FILE}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, _DOE_RATES_STATE_FILE)
+    except OSError:
+        pass
+
+
+def doe_note_rates(league: str, d_div: float, d_ch: float, d_ex: float) -> None:
+    """记一笔 doe 的基准汇率指纹：三个数**整体**变过才算它刷新过。"""
+    try:
+        vals = (float(d_div), float(d_ch), float(d_ex))
+    except (TypeError, ValueError):
+        return
+    if not all(math.isfinite(x) and x > 0 for x in vals):
+        return
+    fp = _doe_hash_prices({"divine": vals[0], "chaos": vals[1], "exalted": vals[2]})
+    if not fp:
+        return
+    now = time.time()
+    with _DOE_RATES_LOCK:
+        _doe_rates_load()
+        prev = _DOE_RATES_FP.get(league)
+        if prev is None or prev[0] != fp:
+            _DOE_RATES_FP[league] = (fp, now)
+            _doe_rates_save()
+
+
+def doe_rates_frozen(league: str) -> tuple[bool, int]:
+    """doe 的基准汇率是不是僵住了：返回 (是否僵住, 已僵多久/秒)。
+
+    没有历史时返回 False —— 跟 ninja_frozen 同理，刚启动不该拿
+    「还不知道」当「不动」，那会一上来就把主源换掉。
+    """
+    with _DOE_RATES_LOCK:
+        _doe_rates_load()
+        entry = _DOE_RATES_FP.get(league)
+    if not entry:
+        return False, 0
+    held = int(time.time() - entry[1])
+    return held >= DOE_RATES_FROZEN_SECONDS, max(held, 0)
 
 
 # --------------------------------------------------------------------------
@@ -2539,6 +2641,12 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     #   stale  = 时间戳太旧（小站干脆不刷新了）
     #   frozen = 时间戳还在动、但价格长时间一个不变（2026-09-28 实测踩到的那种）
     frozen, frozen_age = doe_frozen(league) if doe else (False, 0)
+    # ★ 第三道：基准汇率单独判僵（v1.27.11）。上面那道看的是整体价格指纹，
+    #   会被「其它通货照常在动」掩盖掉——汇率是尺子，必须单独盯着。
+    doe_note_rates(league, d_div, d_ch, d_ex)
+    rates_frozen, rates_age = (
+        doe_rates_frozen(league) if use_doe_base else (False, 0)
+    )
 
     # ★★ 回退前必须先确认「回退目标确实比现在这个新」——不然那不叫回退，叫倒退。
     #
@@ -2627,6 +2735,21 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 f"  · dadsofexile 价格已 {frozen_age // 60} 分钟没变过，"
                 f"但备用源也不动，仍沿用 dadsofexile",
             )
+    if rates_frozen and use_doe_base:
+        if fallback_ok:
+            _to = "poe.ninja（poe2scout 已停更，本轮不可用）" if not scout_fresh else "poe2scout"
+            log_once(
+                f"doe-rates-frozen:{league}",
+                f"  · dadsofexile 的基准汇率已 {rates_age // 60} 分钟没变过"
+                f"（其它通货还在动，但汇率这把尺子不动），本轮改用 {_to}",
+            )
+            use_doe_base = False
+        else:
+            log_once(
+                f"doe-rates-keep:{league}",
+                f"  · dadsofexile 的基准汇率已 {rates_age // 60} 分钟没变过，"
+                f"但备用源也不动，仍沿用 dadsofexile",
+            )
     if stale and use_doe_base:
         if fallback_ok:
             # ⚠️ scout 停更被摘掉后，这里实际落到的是 poe.ninja 的系数 ——
@@ -2644,7 +2767,7 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
                 f"但备用源更旧，仍沿用 dadsofexile",
             )
-    stale = stale or frozen
+    stale = stale or frozen or rates_frozen
 
     # 记下本轮真正用上的基准源，供 /api/meta 告诉界面「现在这个价是谁给的」
     _LAST_BASIS[league] = "doe" if use_doe_base else ("scout" if scout else "ninja")
