@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.14"
+VERSION = "1.27.15"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -799,6 +799,13 @@ SCOUT_MAX_AGE_SECONDS = _clamp_int(
     CONFIG.get("scout_max_age_seconds", 3 * 3600), 3 * 3600, 3600, 7 * 24 * 3600
 )
 _SCOUT_LOCK = threading.Lock()
+# ★★ 长抓取专用锁（2026-09-30 加）。
+#    _SCOUT_LOCK 只护缓存（微秒级），**绝不能**拿它去护网络请求：
+#    /api/meta（经 scout_source_info）、切换数据源查曲线（经 _scout_bulk_history）
+#    都要读这把锁，而 scout 一次全量抓取是 17 个类别 + 分页，慢的时候 90 秒——
+#    实测界面 /api/meta 就被它活活卡住 90 秒，页面一直转圈、切源也没反应。
+#    拆两把锁：读路径只等缓存锁，抓取路径靠这把锁单飞（见 scout_currency_prices）。
+_SCOUT_FETCH_LOCK = threading.Lock()
 _SCOUT_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
 # 各通货在 scout 里的数字 id，换汇明细接口只认这个 id
 _SCOUT_ITEM_IDS: dict[str, dict[str, int]] = {}
@@ -863,8 +870,10 @@ def scout_currency_prices(league: str, *, force: bool = False) -> dict[str, floa
 
     1. **必须单飞**。原来是「查缓存 → 释放锁 → 去抓」，并发抓 14 个类别时
        头 6 个线程会同时发现缓存是冷的，于是同一份**全联盟**数据被重复抓 6 遍，
-       光这一项就让首轮卡 20 秒。现在整个抓取过程都在锁内完成，
+       光这一项就让首轮卡 20 秒。现在整个抓取过程都在**抓取锁**内完成，
        后到的线程等锁时缓存已经热了，直接拿走。
+       ⚠️ 必须是 _SCOUT_FETCH_LOCK 而不是 _SCOUT_LOCK——后者是读路径
+       （/api/meta、查曲线）也要用的，压上网络等待会把界面卡住 90 秒。
     2. **分页要并发**。17 个 scout 类别 + 逐页串行＝十几个请求排队，实测 13.75 秒；
        按类别并发（分页仍在各类别内部串行）后约 3 秒。
     """
@@ -873,6 +882,16 @@ def scout_currency_prices(league: str, *, force: bool = False) -> dict[str, floa
         cached = _SCOUT_CACHE.get(league)
         if cached and not force and now - cached[0] < SCOUT_TTL_SECONDS:
             return dict(cached[1])
+
+    # ★★ 单飞改在 _SCOUT_FETCH_LOCK 上做（原来整段都压在 _SCOUT_LOCK 里，
+    #    见上面那把锁的注释）：等锁的线程拿到的仍是热缓存，单飞效果不变，
+    #    但网络等待期间读路径（/api/meta、查曲线）不再被挡住。
+    with _SCOUT_FETCH_LOCK:
+        now = time.time()
+        with _SCOUT_LOCK:
+            cached = _SCOUT_CACHE.get(league)
+            if cached and not force and now - cached[0] < SCOUT_TTL_SECONDS:
+                return dict(cached[1])
 
         league_part = urllib.parse.quote(league)
 
@@ -953,16 +972,18 @@ def scout_currency_prices(league: str, *, force: bool = False) -> dict[str, floa
                 item_ids.update(sub_ids)
                 source_ts = max(source_ts, sub_ts)
 
-        if source_ts:
-            info = dict(_SCOUT_SOURCE.get(league) or {})
-            info["aggregate_updated_at"] = int(source_ts)
-            info["updated_at"] = max(int(info.get("updated_at") or 0), int(source_ts))
-            _SCOUT_SOURCE[league] = info
+        with _SCOUT_LOCK:
+            if source_ts:
+                info = dict(_SCOUT_SOURCE.get(league) or {})
+                info["aggregate_updated_at"] = int(source_ts)
+                info["updated_at"] = max(int(info.get("updated_at") or 0),
+                                         int(source_ts))
+                _SCOUT_SOURCE[league] = info
 
-        if prices:
-            _SCOUT_CACHE[league] = (now, prices)
-            _SCOUT_ITEM_IDS[league] = item_ids
-            _SCOUT_QUANTITY[league] = (now, quantities)
+            if prices:
+                _SCOUT_CACHE[league] = (now, prices)
+                _SCOUT_ITEM_IDS[league] = item_ids
+                _SCOUT_QUANTITY[league] = (now, quantities)
         return dict(prices)
 
 
@@ -3796,7 +3817,19 @@ SCOUT_BACKFILL_EVERY = _clamp_int(
 SCOUT_BACKFILL_WORKERS = 4
 
 
-def _scout_bulk_history(league: str) -> dict[str, dict[int, float]]:
+# ★ 批量历史的缓存（2026-10-01 用户反馈「切换数据源看曲线非常慢」）。
+#
+# 这个端点一次返回 829 个物品 × 24 条小时级记录，拉一次加解析要几秒；
+# 而它给的数据是**小时级**的，没必要每切一次源、每换一个通货就重新拉一遍。
+# 缓存住之后切换是瞬时的；另有后台线程定时把它预热好（见 HistoryWarmer），
+# 用户切过去的时候数据早就备好了，不存在「用到了才去拉」的等待。
+SCOUT_HIST_TTL_SECONDS = _clamp_int(
+    CONFIG.get("scout_history_ttl_seconds", 20 * 60), 20 * 60, 5 * 60, 120 * 60
+)
+_SCOUT_HIST_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _scout_bulk_history(league: str, *, force: bool = False) -> dict[str, dict[int, float]]:
     """一次拿全部物品的小时级历史，返回 {api_id: {时间点: 以崇高石计价的价格}}。
 
     ★ 这个端点（/Leagues/{league}/Items/PriceHistory）比逐个通货去问好太多：
@@ -3806,7 +3839,14 @@ def _scout_bulk_history(league: str) -> dict[str, dict[int, float]]:
 
     实测 2026-09-29：返回 829 个物品、每个 24 条小时级记录。
     拿不到就返回空 dict，调用方退回逐个问的老办法。
+
+    force=True 用于后台预热线程强制刷新；正常读取走缓存。
     """
+    now = time.time()
+    with _SCOUT_LOCK:
+        cached = _SCOUT_HIST_CACHE.get(league)
+        if cached and not force and now - cached[0] < SCOUT_HIST_TTL_SECONDS:
+            return cached[1]
     # 先把 apiId → ItemId 的映射喂热（scout_currency_prices 顺手就填了，有缓存）
     try:
         scout_currency_prices(league)
@@ -3847,6 +3887,10 @@ def _scout_bulk_history(league: str) -> dict[str, dict[int, float]]:
                 hist[int(stamp)] = price
         if hist:
             out[api_id] = hist
+    # 空结果不进缓存：那是「端点挂了 / 映射还没喂热」，缓存了会一直空下去
+    if out:
+        with _SCOUT_LOCK:
+            _SCOUT_HIST_CACHE[league] = (time.time(), out)
     return out
 
 
@@ -4022,6 +4066,100 @@ def backfill_from_scout(league: str | None = None) -> dict:
         f"覆盖 {len(gaps)} 段空档）")
     return {"ok": True, "added": len(records), "points": len(rates),
             "gaps": len(gaps), "granularity": gran}
+
+
+# ★★ 曲线数据预热（2026-10-01 用户反馈：切换数据源看曲线要等好几秒）
+HISTORY_WARM_ENABLED = bool(CONFIG.get("history_warm_enabled", True))
+HISTORY_WARM_INTERVAL = _clamp_int(
+    CONFIG.get("history_warm_interval_seconds", 10 * 60), 10 * 60, 2 * 60, 120 * 60
+)
+
+
+class SourceWarmer(threading.Thread):
+    """后台把**所有源**的数据提前拉好、缓存起来。
+
+    ★ 为什么需要它（2026-10-01 用户反馈）：
+      切换数据源——不管是详情里换曲线来源，还是右上角换取价主源——本来都得现去
+      问一次上游。scout 那个批量端点一次返回 829 个物品 × 24 条，实测要等好几秒，
+      手感就是「点一下卡一下、鼠标转圈」。而这些数据都是小时级的，早就该备好。
+
+      用户要的是「所有源的数据都同时缓存好，切哪个都是立马切换」，
+      所以这里**三个源一起预热**，不是只预热曲线用到的那一份：
+        · doe / scout / ninja 各自的价（换取价主源时靠它们立刻重算价格表）
+        · scout 的批量历史 + ninja 的走势（详情曲线切源时用）
+
+      预热失败也不影响使用——那时退化成「用到才拉」，跟以前一样，只是慢一点。
+
+    预热间隔取缓存 TTL 的一半（默认 10 分钟 vs scout 历史 20 分钟），这样缓存
+    永不过期，任何时刻切换都命中缓存，不会出现「刚好过期要等一次请求」的卡顿。
+    """
+
+    def __init__(self, interval: int = HISTORY_WARM_INTERVAL):
+        super().__init__(name="source-warmer", daemon=True)
+        self.interval = max(60, int(interval))
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def warm_once(self) -> dict:
+        """拉一轮并塞进缓存，返回各源拿到的条目数（自检直接调它，不用起线程）。"""
+        league = str(STATE.get("league") or "")
+        out = {"doe": 0, "scout": 0, "ninja": 0, "scout_hist": 0}
+        if not league:
+            return out
+
+        # ⚠️ 这里一律**不**用 force：各函数自己的 TTL 才是刷新的依据。
+        #    force=True 会让每轮预热都把所有源重拉一遍，请求量翻好几倍；
+        #    而不带 force 时「缓存还热就跳过、快过期才真拉」，
+        #    效果一样是「任何时刻切换都命中缓存」，请求却少得多。
+        # —— 曲线用：scout 批量历史（最慢的一份，829 物品 × 24 条）
+        try:
+            out["scout_hist"] = len(_scout_bulk_history(league))
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 预热：poe2scout 历史没取到（不影响使用）：{exc}")
+
+        # —— 取价用：三个源各自的价。切换主源时靠它们立刻重算，不用等网络
+        try:
+            out["doe"] = len(doe_prices(league) or {})
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 预热：dadsofexile 没取到（不影响使用）：{exc}")
+        try:
+            out["scout"] = len(scout_currency_prices(league) or {})
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 预热：poe2scout 价格没取到（不影响使用）：{exc}")
+        try:
+            # ⚠️ URL 必须跟 fetch_category 里**一模一样**，否则缓存键对不上、
+            #    预热存的和抓取查的是两个 key，等于白预热一遍。
+            #    （urlencode 会把空格编成 +，quote 编成 %20，两者不通。）
+            for category, _label in CATEGORIES:
+                url = (
+                    f"{NINJA_API}/exchange/current/overview"
+                    f"?league={urllib.parse.quote(league)}"
+                    f"&type={urllib.parse.quote(category)}"
+                )
+                out["ninja"] += len(
+                    (ninja_cached(url) or {}).get("lines") or []
+                )
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 预热：poe.ninja 没取到（不影响使用）：{exc}")
+        return out
+
+    def run(self) -> None:
+        # 先等一轮抓取：预热要用 apiId→ItemId 映射，映射还没喂热时拉了也是空的
+        if self._stop.wait(25):
+            return
+        while not self._stop.is_set():
+            try:
+                got = self.warm_once()
+                if any(got.values()):
+                    log(f"  · 各源数据已预热：doe {got['doe']} / scout {got['scout']} / "
+                        f"ninja {got['ninja']} 条价，scout 历史 {got['scout_hist']} 个物品"
+                        f"（切换数据源时直接读缓存）")
+            except Exception:                                      # noqa: BLE001
+                pass
+            if self._stop.wait(self.interval):
+                return
 
 
 class ScoutBackfillWorker(threading.Thread):
@@ -4762,6 +4900,7 @@ def _history_from_scout(currency_id: str, hours: int, meta) -> dict:
     """直接向 poe2scout 要这个通货的历史（小时级，最近 24 小时）。
 
     批量端点一次就能拿到全部物品；它挂了才退回逐个问（6 小时粒度、36 小时）。
+    批量那份带 20 分钟缓存（它给的数据本来就是小时级的），所以正常路径不走网络。
     价格是 exalted 计价，divine/chaos 用同一时间网格上基准货币的价换算。
     """
     league = str(STATE.get("league") or "")
@@ -4796,8 +4935,15 @@ def _history_from_ninja(currency_id: str, hours: int, meta) -> dict:
     """
     league = str(STATE.get("league") or "")
     cutoff = time.time() - hours * 3600
-    q = urllib.parse.urlencode({"league": league, "type": "Currency"})
-    payload = http_json(f"{NINJA_API}/exchange/current/overview?{q}", retries=2)
+    # ★ 走缓存而不是每次现拉（2026-10-01 优化）：ninja 这份是小时级的，
+    #   切换数据源时应当命中缓存；后台预热线程会定时把它刷新好。
+    # ⚠️ URL 必须和 fetch_category / 预热线程用的是同一个（quote 编空格为 %20，
+    #    不是 urlencode 的 +），否则缓存键对不上，每次切换都白拉一遍。
+    url = (
+        f"{NINJA_API}/exchange/current/overview"
+        f"?league={urllib.parse.quote(league)}&type={urllib.parse.quote('Currency')}"
+    )
+    payload = ninja_cached(url)
     rates = (payload.get("core") or {}).get("rates") or {}
     n_ex = float(rates.get("exalted") or 0.0)     # 1 divine = ? exalted
     n_ch = float(rates.get("chaos") or 0.0)       # 1 divine = ? chaos
@@ -6034,7 +6180,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             value = str((body or {}).get("source") or "").strip().lower()
-            self._json({"ok": True, "source": set_primary_source(value)})
+            before = primary_source()
+            now = set_primary_source(value)
+            # ★ 换源必须立刻重抓一轮（2026-10-01）：
+            #   主源变了，库里那批价还是按旧源算的，不重抓的话界面要等到下一个
+            #   采集周期（5 分钟）才会变——用户切完源看到价格纹丝不动，
+            #   只会以为切换没生效。这里唤醒抓取线程立刻按新源抓一轮。
+            worker = getattr(self.server, "worker", None)
+            if worker and now != before and hasattr(worker, "wake"):
+                worker.wake.set()
+            self._json({"ok": True, "source": now, "refetching": bool(
+                worker and now != before and hasattr(worker, "wake"))})
         except Exception as exc:                                # noqa: BLE001
             log(f"接口异常 {parsed.path}: {exc}")
             self._json({"error": str(exc)}, status=500)
@@ -6631,6 +6787,13 @@ def main() -> None:
     # 云端那头实测只有 ~23% 的跑成率，这个兜底保证「离线回来一定补得到东西」。
     if SCOUT_BACKFILL:
         ScoutBackfillWorker(str(STATE.get("league") or CONFIG.get("league") or "")).start()
+
+    # 各源数据预热：把三个源的价 + 曲线历史都提前缓存好，
+    # 切换数据源（详情曲线 / 取价主源）时直接读缓存，不用现等一次网络请求。
+    if HISTORY_WARM_ENABLED:
+        SourceWarmer().start()
+        log(f"数据源预热已启用（每 {HISTORY_WARM_INTERVAL // 60} 分钟刷一次，"
+            f"切换数据源时直接读缓存）")
 
     server, port = bind_server()
     server.worker = worker  # type: ignore[attr-defined] - 供 HTTP handler 调用切换联盟
