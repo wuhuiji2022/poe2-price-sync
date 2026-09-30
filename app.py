@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.11"
+VERSION = "1.27.12"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -166,6 +166,7 @@ DEFAULT_CONFIG: dict = {
     #    设成 45 分钟会在它正常待着的时候误判、来回切源把价格抖出 10% 的台阶。
     "doe_frozen_seconds": 9000,  # 2.5 小时
     "doe_rates_frozen_seconds": 21600,  # 6 小时：基准汇率单独判僵的门槛（v1.27.11）
+    "doe_rate_diverge_ratio": 0.15,  # 15%：doe 与 ninja 汇率差这么多就换 ninja（v1.27.12）
     # ★ 三个源的请求间隔是分开的（秒），别合成一个：
     #   dadsofexile 约 10 分钟重算 → 4 分钟取一次，跟得上
     #   poe.ninja   实测 6~82 分钟刷一次 → 1 小时取一次（原来每轮每类别都打，太浪费）
@@ -453,6 +454,14 @@ def _clamp_int(raw, fallback: int, low: int, high: int) -> int:
     """把配置项夹到合法区间，避免手改 config.json 时写错导致崩溃。"""
     try:
         return max(low, min(high, int(raw)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _clamp_float(raw, fallback: float, low: float, high: float) -> float:
+    """_clamp_int 的浮点版（比例类配置项用）。"""
+    try:
+        return max(low, min(high, float(raw)))
     except (TypeError, ValueError):
         return fallback
 
@@ -1062,6 +1071,9 @@ def scout_qty_status(league: str) -> dict:
 # 为什么要记：界面上得能说清「现在这个价是谁给的、它多久没动了」——
 # 否则用户看到一条直线，分不清是市场没动、还是源僵了、还是程序坏了。
 _LAST_BASIS: dict[str, str] = {}
+# 联盟 -> 本轮 dadsofexile 与 poe.ninja 的汇率偏差（比值，0.16 表示差 16%）。
+# 供 price_status 报给界面：两个源互相矛盾时，得让用户看得见。
+_LAST_DIVERGE: dict[str, float] = {}
 
 
 def price_status(league: str) -> dict:
@@ -1081,6 +1093,17 @@ def price_status(league: str) -> dict:
         _frozen = bool(f_price or f_rate)
         held = max(h_price, h_rate)
         label = "dadsofexile"
+        # 两个源互相矛盾也要说出来（v1.27.12）：这条不需要历史，
+        # 是唯一在无落盘环境下（云端 Actions）也能当场判出来的异常。
+        _dv = float(_LAST_DIVERGE.get(league) or 0.0)
+        if _dv >= DOE_RATE_DIVERGE_RATIO:
+            return {
+                "ok": False,
+                "basis": basis,
+                "held_minutes": held // 60,
+                "reason": f"dadsofexile 的基准汇率与 poe.ninja 相差 {_dv:.0%}，"
+                          f"两边对不上，当前显示的可能是偏得更多的那一边",
+            }
     elif basis == "ninja":
         _frozen, held = ninja_frozen(league)
         label = "poe.ninja"
@@ -1324,6 +1347,21 @@ DOE_STALE_SECONDS = _clamp_int(
 DOE_FROZEN_SECONDS = _clamp_int(
     CONFIG.get("doe_frozen_seconds", 150 * 60), 150 * 60, 120 * 60, 24 * 3600
 )
+# ★ dadsofexile 与 poe.ninja 的基准汇率相差多大，就认定「doe 这把尺子不对」。
+#
+# 这条是唯一**不需要历史**的判据（v1.27.12），专门为云端补的：
+#   上面那些「指纹多久没变」的判据都靠本机落盘文件，而 GitHub Actions 每次都是
+#   干净容器、只有 data.json 会留下来 → 云端永远「无历史」→ 一律判不出僵
+#   → 云端补的那几轮就一直写着 doe 的 482.92（比 ninja 低 16%，v1.27.11 实测）。
+#   单次运行就能比出来的只有「两个源此刻差多少」，云端本机都生效。
+#
+# 阈值为什么是 15%：两个源口径不同，平时本来就有几个点的差；
+# 真出事时差的是十几个点（2026-09-30 实测 doe 482.92 vs ninja 575.6 = 16%）。
+# 宁可放过几个点、也不能让正常波动天天触发换源。可在 config 里调。
+DOE_RATE_DIVERGE_RATIO = _clamp_float(
+    CONFIG.get("doe_rate_diverge_ratio", 0.15), 0.15, 0.08, 0.50
+)
+
 # 一轮里至少有多大比例的「可用条目」价格变了，才算 doe 真的刷新过。
 # 它一次正常刷新会让几百项一起变（实测 500~650 项）；僵住时只有零星几项在动。
 DOE_REFRESH_MIN_RATIO = 0.02
@@ -2647,6 +2685,24 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     rates_frozen, rates_age = (
         doe_rates_frozen(league) if use_doe_base else (False, 0)
     )
+    # ★ 第四道（v1.27.12）：**不需要历史**的判据 —— doe 与 ninja 的汇率对不对得上。
+    #   上面三道全靠本机落盘的指纹历史，云端 Actions 每次都是干净容器 → 永远无历史
+    #   → 云端一条都判不出来（所以 v1.27.11 推上去后云端还在写 482.92）。
+    #   这条只看两个源此刻差多少，当场就能判，云端本机都生效。
+    #   ⚠️ 只比 exalted 这一对（1 神圣 = ? 崇高）：
+    #     · 它是整套折算的主尺子，也是用户在游戏里反复核对过的那个数；
+    #     · chaos 那对**不能**放进判据 —— 两家对混沌石的聚合口径正常时期就差 30%+
+    #       （2026-09-29 用户核对真值：doe 混沌 +36% vs ninja +0%），
+    #       放进来会在两家都健康时天天误触发（定向自检 681% 那次失败的根源）。
+    #   ⚠️ 注意此时的 f_exalted 还是 **ninja** 的值（doe 的要在下面才覆盖）。
+    rate_diverged, diverge_ratio = False, 0.0
+    if use_doe_base and ninja_rates_ok:
+        _doe_rate = d_div / d_ex if d_ex > 0 else 0.0
+        if (_doe_rate > 0 and math.isfinite(_doe_rate)
+                and f_exalted > 0 and math.isfinite(f_exalted)):
+            diverge_ratio = abs(_doe_rate - f_exalted) / f_exalted
+            rate_diverged = diverge_ratio >= DOE_RATE_DIVERGE_RATIO
+    _LAST_DIVERGE[league] = diverge_ratio
 
     # ★★ 回退前必须先确认「回退目标确实比现在这个新」——不然那不叫回退，叫倒退。
     #
@@ -2750,6 +2806,23 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 f"  · dadsofexile 的基准汇率已 {rates_age // 60} 分钟没变过，"
                 f"但备用源也不动，仍沿用 dadsofexile",
             )
+    if rate_diverged and use_doe_base:
+        # ★ 这是唯一不需要历史的判据（v1.27.12）：上面三道在云端（无落盘）
+        #   永远判不出来，这条当场就能比出来。偏差大 = doe 这把尺子此刻不可信。
+        if fallback_ok:
+            _to = "poe.ninja（poe2scout 已停更，本轮不可用）" if not scout_fresh else "poe2scout"
+            log_once(
+                f"doe-diverge:{league}",
+                f"  · dadsofexile 的基准汇率与 poe.ninja 相差 {diverge_ratio:.0%}"
+                f"（两边对不上），本轮改用 {_to}",
+            )
+            use_doe_base = False
+        else:
+            log_once(
+                f"doe-diverge-keep:{league}",
+                f"  · dadsofexile 的基准汇率与 poe.ninja 相差 {diverge_ratio:.0%}，"
+                f"但备用源不可用，仍沿用 dadsofexile",
+            )
     if stale and use_doe_base:
         if fallback_ok:
             # ⚠️ scout 停更被摘掉后，这里实际落到的是 poe.ninja 的系数 ——
@@ -2767,10 +2840,10 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 f"  · dadsofexile 数据已 {stale_age // 60} 分钟没刷新，"
                 f"但备用源更旧，仍沿用 dadsofexile",
             )
-    stale = stale or frozen or rates_frozen
+    stale = stale or frozen or rates_frozen or rate_diverged
 
     # 记下本轮真正用上的基准源，供 /api/meta 告诉界面「现在这个价是谁给的」
-    _LAST_BASIS[league] = "doe" if use_doe_base else ("scout" if scout else "ninja")
+    _LAST_BASIS[league] = "doe" if use_doe_base else ("scout" if (scout_fresh and scout) else "ninja")
 
     # 挂出量 / 求购量改用 poe2scout 的「全交易所交易对快照」，doe 只做兜底。
     # ⚠️ 旧口径只查「对崇高石」那一个交易对、且只取自己那一侧，
@@ -2796,7 +2869,7 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         f_divine = 1.0
         f_exalted = d_div / d_ex
         f_chaos = d_div / d_ch
-    elif scout and s_div > 0 and s_ch > 0 and s_ex > 0:
+    elif scout_fresh and scout and s_div > 0 and s_ch > 0 and s_ex > 0:
         f_divine = 1.0
         f_exalted = s_div / s_ex
         f_chaos = s_div / s_ch
