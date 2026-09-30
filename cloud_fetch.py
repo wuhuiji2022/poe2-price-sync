@@ -19,9 +19,11 @@
     "ts": [1696000000, ...],
     "items": {"<currency_id>": {"cat": "...",
                                 "d": [...], "e": [...], "c": [...],
-                                "o": [...], "s": [...]}}
+                                "o": [...], "s": [...], "v": [...]}}
   }
-  数组与 ts 一一对应；缺值用 null。d/e/c = 神圣/崇高/混沌计价，o = 挂出量，s = 求购量。
+  数组与 ts 一一对应；缺值用 null。d/e/c = 神圣/崇高/混沌计价，o = 挂出量，
+  s = 求购量，v = 成交热度（v1.27.14 才加，更早那份 data.json 没有这一列，
+      客户端按 null 处理）。
 """
 import json
 import os
@@ -36,7 +38,7 @@ WINDOW_HOURS = 48
 DATA_FILE = pathlib.Path(os.environ.get("POE2_CLOUD_DATA") or _HERE / "data.json")
 LEAGUE = os.environ.get("POE2_LEAGUE") or "Forbidden Rites"
 
-FIELDS = ("d", "e", "c", "o", "s")
+FIELDS = ("d", "e", "c", "o", "s", "v")
 
 
 def normalize(data: dict) -> int:
@@ -113,6 +115,10 @@ def append_snapshot(data: dict, rows, ts: int | None = None) -> int:
         item["c"][idx] = row["value_chaos"]
         item["o"][idx] = row["orders"]
         item["s"][idx] = row["stock"]
+        # ★ v1.27.14 才带上成交热度。以前只补价格不补量，客户端读到的就是 0，
+        #   而云端那行时间戳更新 → 把本机抓到的有量行顶掉，全站成交热度归零。
+        # 用 .get：查询里漏了这一列时宁可存 null（读侧会兜底），也别整轮崩掉。
+        item["v"][idx] = dict(row).get("volume")
     return len(rows)
 
 
@@ -156,7 +162,7 @@ def main() -> int:
     # 同时排除 synthetic：那是 7 天日线反推的历史点，不能当本轮实测值。
     rows = app.db().execute(
         "SELECT currency_id, category, MAX(ts) AS mts, value_divine, value_exalted,"
-        " value_chaos, orders, stock"
+        " value_chaos, orders, stock, volume"
         " FROM snapshot WHERE league = ? AND ts <= ?"
         " AND (source IS NULL OR source != 'synthetic')"
         " GROUP BY currency_id",
