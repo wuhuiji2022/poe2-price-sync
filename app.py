@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.12"
+VERSION = "1.27.13"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -3217,6 +3217,22 @@ def prune_snapshot(league: str) -> None:
 _ETAG_CACHE: dict[str, str] = {}
 _ETAG_LOCK = threading.Lock()
 
+# 最近一次探测失败的异常描述（v1.27.13）。
+# ⚠️ 探测失败原本被 `except Exception: return -1` 整个吞掉，日志只留「探测失败」
+#    四个字，是超时 / 连接重置 / DNS 全看不出来（2026-09-30 排查时只能手工复现请求）。
+#    这里把原因留一笔，主循环取走后清空。
+_PROBE_ERROR: list[str] = []
+
+
+def take_probe_error() -> str:
+    """取走最近一次探测失败的原因（取走即清空），没有就返回空串。"""
+    with _ETAG_LOCK:
+        if not _PROBE_ERROR:
+            return ""
+        why = _PROBE_ERROR[-1]
+        _PROBE_ERROR.clear()
+        return why
+
 
 def _overview_url(league: str, category: str) -> str:
     return (
@@ -3249,7 +3265,9 @@ def probe_updates(league: str) -> tuple[bool, int]:
         except urllib.error.HTTPError as exc:
             last_code = exc.code
             etag = exc.headers.get("ETag") or ""
-        except Exception:  # noqa: BLE001 - 探测失败按"没变"处理，下一轮再来
+        except Exception as exc:  # noqa: BLE001 - 探测失败不等于断网，交给主循环处理
+            with _ETAG_LOCK:
+                _PROBE_ERROR.append(f"{type(exc).__name__}: {exc}")
             return changed, -1
         if last_code == 429:
             return False, 429
@@ -4206,6 +4224,23 @@ class FetchWorker(threading.Thread):
                 STATE["online"] = False
         return streak
 
+    def _on_probe_failed(self) -> bool:
+        """探测请求失败了：返回 True 表示「这一轮直接拉全量」。
+
+        ★★ 探测失败 ≠ 断网（2026-09-30 用户反馈「为什么是离线状态」的根因）：
+          探测只是「省几个请求」的优化手段——发个条件请求问一句「源站数据变了吗」，
+          它超时或被重置一下，**不代表网络不通**。
+          旧写法把它计进 `fail_streak`，于是 17:55 和 18:00 两次瞬时抖动就把界面
+          标成「离线」整整 5 分钟，而那期间全量抓取一直成功、数据完全正常。
+
+          → 探测不了就老实拉一次全量：只有**全量也失败**才算真断网
+            （那时 take_snapshot 抛异常，主循环的 except 会记一次失败）。
+          抽成方法是为了让自检能打到这段真实逻辑上，而不是去测一份复制品。
+        """
+        why = take_probe_error()
+        log(f"  · 探测请求失败{('（' + why + '）') if why else ''}，本轮直接拉一次全量")
+        return True
+
     def run(self) -> None:
         """主循环：先用低成本探测问「变了吗」，变了才拉全量。
 
@@ -4240,11 +4275,7 @@ class FetchWorker(threading.Thread):
                         self._wait(backoff)
                         continue
                     if code == -1:
-                        # 探测本身失败了（多半是断网），标记一次失败
-                        streak = self._mark_failed(RuntimeError("探测请求失败"))
-                        log(f"探测失败（连续 {streak} 次），5 分钟后重试")
-                        self._wait(min(300, self.interval))
-                        continue
+                        need_full = self._on_probe_failed()
                     stale = (now - int(STATE.get("last_success") or 0)) > POLL_FALLBACK_SECONDS
                     if changed:
                         log("  ✓ 探测到源站数据已更新，立即拉取")
