@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.13"
+VERSION = "1.27.14"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -3440,6 +3440,44 @@ def last_snapshot_values(league: str, before_ts: int) -> dict[str, tuple]:
     }
 
 
+# ★★ 成交热度最多回溯多久。
+#
+# 成交量是「累计成交了多少」的日级指标（poe.ninja 的 volumePrimaryValue），
+# 一天之内不会跳变，所以几天前的值仍可作数；但再久就真是另一个行情了，
+# 宁可承认「不知道」也不要拿僵尸值充数。
+VOLUME_FALLBACK_SECONDS = 7 * 24 * 3600
+
+
+def latest_volume_map(league: str) -> dict[str, float]:
+    """每个通货「最近一次真正有成交量」的 volume。
+
+    ★ 为什么不能直接用最新那一行（2026-09-30 事故）：
+      云端补入的行（source='cloud'）只有价格，成交量恒为 0（data.json 没存这一列），
+      而它的时间戳更新 → 按「每个通货取 MAX(ts) 行」的读法，
+      它把本机抓到的、带着成交量的行**顶掉**了。实测：云端补一轮之后
+      661 个通货里有 651 个的成交热度瞬间变成 0，
+      倒货榜默认筛「成交热度 ≥ 1000」→ 整个榜单直接空掉。
+
+      成交量是「累计成交了多少」，不会因为补进来一个价格点就归零，
+      所以它该按「最近一次真有量」来读，而不是跟着最新一行走。
+    """
+    cutoff = int(time.time()) - VOLUME_FALLBACK_SECONDS
+    return {
+        r["currency_id"]: float(r["volume"] or 0.0)
+        for r in db().execute(
+            "SELECT s.currency_id, s.volume FROM snapshot s"
+            " JOIN (SELECT currency_id, MAX(ts) AS mts FROM snapshot"
+            "       WHERE league = ? AND volume > 0"
+            "         AND (source IS NULL OR source != 'synthetic')"
+            "         AND ts >= ?"
+            "       GROUP BY currency_id) m"
+            "   ON s.currency_id = m.currency_id AND s.ts = m.mts"
+            " WHERE s.league = ?",
+            (league, cutoff, league),
+        ).fetchall()
+    }
+
+
 def latest_snapshot_rows(league: str, fields: list[str],
                          category: str | None = None) -> list:
     """每个通货「最近一次写进库」的那一行——**跨轮次**取最新，不是「最新一轮」。
@@ -3467,7 +3505,21 @@ def latest_snapshot_rows(league: str, fields: list[str],
     if category and category != "all":
         sql += " AND s.category = ?"
         params.append(category)
-    return db().execute(sql, params).fetchall()
+    rows = db().execute(sql, params).fetchall()
+
+    # 最新一行是云端补的（volume 恒 0）时，成交热度会被抹平。
+    # 这里把它换成「最近一次真有量」的值——见 latest_volume_map 的说明。
+    if any("volume" in f for f in fields):
+        vol = latest_volume_map(league)
+        patched = []
+        for r in rows:
+            d = dict(r)
+            value = d.get("volume") or 0.0
+            if not value > 0:                      # 0 / None / NaN 都算「没有」
+                d["volume"] = vol.get(d.get("currency_id"), 0.0)
+            patched.append(d)
+        return patched
+    return rows
 
 
 def take_snapshot(league: str) -> tuple[int, int]:
@@ -3698,7 +3750,10 @@ def sync_from_cloud() -> dict:
                 (
                     ts, league, str(item.get("cat") or ""), str(cid),
                     pick("d"), exalted, pick("c"),
-                    0.0, None, "[]",                 # volume / trend / spark：云端不存
+                    # 成交热度：v1.27.14 起云端也会带（data.json 的 v 列）。
+                    # 老数据没有这一列 → pick 返回 None → 记 0，
+                    # 读侧会用「最近一次真有量」兜住，不会让热度归零。
+                    float(pick("v") or 0.0), None, "[]",
                     pick("s") or 0.0, int(pick("o") or 0),
                     "cloud",
                 )
