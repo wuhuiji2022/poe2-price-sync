@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.27.15"
+VERSION = "1.28.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -328,6 +328,31 @@ CREATE TABLE IF NOT EXISTS snapshot (
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_lookup
     ON snapshot (league, currency_id, ts DESC);
+-- 按「取价源」分开存的历史价（v1.28.0）。
+--
+-- 为什么必须有它：上面那张 snapshot 每轮只记**一个**价，用的是当前选定的源；
+-- 用户把主源从 dadsofexile 切到 poe2scout 时，库里没有 scout 口径的历史，
+-- 只能等下一轮重抓——实测冷缓存下要等 267 秒，界面上就是「切了源价格不动」。
+-- 现在每轮把三个源各自算出来的价都记一份，切源纯粹是换一张表读，
+-- 当前价、区间涨跌、曲线全部立刻跟着变，不用等任何网络请求。
+--
+-- ⚠️ 只存价（d/e/c）与类别：挂出量/求购量（stock/orders）只有 poe2scout 一家提供、
+--    成交热度（volume）与 7 天趋势（trend/spark）也只有 poe.ninja 有，
+--    它们跟「取价源」无关，读的时候从 snapshot 那张表借，不在这里重复存。
+CREATE TABLE IF NOT EXISTS snapshot_src (
+    ts            INTEGER NOT NULL,
+    league        TEXT    NOT NULL,
+    category      TEXT    NOT NULL,
+    currency_id   TEXT    NOT NULL,
+    source        TEXT    NOT NULL,   -- 'doe' / 'scout' / 'ninja'
+    value_divine  REAL,
+    value_exalted REAL,
+    value_chaos   REAL,
+    origin        TEXT DEFAULT 'local',  -- local=本机算的, cloud=云端补的
+    PRIMARY KEY (ts, league, currency_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_src_lookup
+    ON snapshot_src (league, source, currency_id, ts DESC);
 CREATE TABLE IF NOT EXISTS spread (
     ts           INTEGER NOT NULL,
     league       TEXT    NOT NULL,
@@ -2673,6 +2698,20 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         except Exception:  # noqa: BLE001 - doe 是个人小站，挂了不影响主流程
             doe = {}
 
+    # ★★ 三个源各自的尺子先独立算出来（v1.28.0 按源分表的数据基础）。
+    #    下面几行会按「用户选定的主源」把 doe / scout 清掉，那是给**规范行**
+    #    （snapshot 表里那一行）用的；而 by_source 要给出三个源各自的口径，
+    #    无论用户此刻选了哪个源都算得出来——这正是「切源即时」的来源。
+    #    所以这两份必须在裁剪之前留底，否则切到 scout 后 doe 口径就没了。
+    _full_doe, _full_scout = doe, scout
+    fd_div = float((_full_doe.get("divine") or {}).get("price") or 0.0)
+    fd_ch = float((_full_doe.get("chaos") or {}).get("price") or 0.0)
+    fd_ex = float((_full_doe.get("exalted") or {}).get("price") or 1.0)
+    _doe_view_ok = fd_div > 0 and fd_ch > 0 and fd_ex > 0
+    fs_div = float(_full_scout.get("divine") or 0.0)
+    fs_ch = float(_full_scout.get("chaos") or 0.0)
+    fs_ex = float(_full_scout.get("exalted") or 1.0)
+
     # ★ 用户选定的主源：把不该用的那份清掉即可——下面取价时取不到就会自然
     #   落到 ninja 自带的系数上（见 rows 循环里的 price=None 分支）。
     #   两份数据仍然照抓（都有缓存，不额外发请求），这样切回 auto 时立刻可用。
@@ -2764,6 +2803,11 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
     if not scout_fresh:
         scout = {}
         s_div = s_ch = s_ex = 0.0
+
+    # ★ scout 这一路到底能不能算（v1.28.0 的分源口径要用）。
+    #   ⚠️ 必须放在上面 scout_fresh 判完之后：停更的 scout 是「不可用」，
+    #      不是「可用但值为 0」，两者在分源表里的处置完全不同（前者不写行）。
+    _scout_view_ok = bool(scout_fresh and fs_div > 0 and fs_ch > 0 and fs_ex > 0)
 
     fallback_ok = True
     if _primary == "doe":
@@ -2917,14 +2961,35 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
             price = scout[cid]
             base_div, base_ch, base_ex = s_div, s_ch, s_ex
 
+        # ninja 口径：它自己的价 × 它自己的系数（三家都有，永远兜得住）
+        ninja_view = (
+            primary_value * f_divine,
+            primary_value * f_exalted,
+            primary_value * f_chaos,
+        )
+
         if price and base_div > 0 and base_ch > 0 and base_ex > 0:
             divine = price / base_div
             exalted = price / base_ex
             chaos = price / base_ch
         else:
-            divine = primary_value * f_divine
-            exalted = primary_value * f_exalted
-            chaos = primary_value * f_chaos
+            divine, exalted, chaos = ninja_view
+
+        # ★★ 三个源各算一套价（v1.28.0）。切源时读的就是这里存下来的东西——
+        #    doe/scout 各自的基准货币当尺子，用谁的价就用谁的尺子；
+        #    该源此刻不可用（doe 没有这条 / scout 停更）就算不出来，存 None，
+        #    读侧会退回 ninja 口径，绝不拿别的源的价冒充。
+        by_source: dict[str, tuple | None] = {"ninja": ninja_view}
+        _dr = _full_doe.get(cid)
+        by_source["doe"] = (
+            (_dr["price"] / fd_div, _dr["price"] / fd_ex, _dr["price"] / fd_ch)
+            if (_dr and _dr.get("ok") and _doe_view_ok) else None
+        )
+        _sp = _full_scout.get(cid)
+        by_source["scout"] = (
+            (_sp / fs_div, _sp / fs_ex, _sp / fs_ch)
+            if (_sp and _scout_view_ok) else None
+        )
 
         ask_v, bid_v = pick_ask_bid(
             cid, pair_ask, pair_bid, scout_qty, doe_row, doe_is_stale=stale
@@ -2933,6 +2998,7 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         rows.append(
             {
                 "id": cid,
+                "by_source": by_source,
                 "divine": divine,
                 "exalted": exalted,
                 "chaos": chaos,
@@ -3225,6 +3291,8 @@ def prune_snapshot(league: str) -> None:
     with db() as connection:
         cutoff = int(time.time()) - RETENTION_DAYS * 86400
         connection.execute("DELETE FROM snapshot WHERE ts < ?", (cutoff,))
+        # 分源那份跟着同一个保留期一起清，否则它会悄悄攒成库里的第二大表
+        connection.execute("DELETE FROM snapshot_src WHERE ts < ?", (cutoff,))
         connection.execute(
             "UPDATE snapshot SET spark = NULL"
             " WHERE spark IS NOT NULL"
@@ -3407,29 +3475,46 @@ def save_tracker_state(tracker: UpdateTracker) -> None:
 FETCH_WORKERS = _clamp_int(CONFIG.get("fetch_workers", 6), 6, 1, 12)
 
 
-def warm_shared_sources(league: str) -> None:
-    """并发抓类别之前，先把「跟类别无关」的那几份联盟级数据取一遍。
+def warm_shared_sources(league: str, *, quiet: bool = False) -> None:
+    """并发抓类别之前，先把「跟类别无关」的联盟级数据取一遍——**三个源都要**。
 
     为什么必须单独预热：fetch_category 每个类别都要 scout 汇率、doe 基准价、
     全交易对挂出量这些**全联盟**数据。它们本身有缓存，但并发一起跑时
     头几个线程会同时发现缓存是冷的，于是同一份数据被重复抓好几遍——
     这是实测里首轮比后续轮慢 18 秒的真正原因（不是带宽、不是数据量）。
-    开局串行取一次把缓存喂热，后面 14 个类别就全是缓存命中。
+    开局取一次把缓存喂热，后面 14 个类别就全是缓存命中。
+
+    ★★ v1.28.0：不再 `if PRICE_SOURCE != "scout": return`。
+    fetch_category 现在要算**三个源各自**的口径（按源分表就靠它），
+    所以 doe / scout 的数据每一轮都得是热的，跟当前选了哪个主源无关。
+    这也正是「同时缓存所有源」那句话的落点：缓存不热，切过去就要现拉——
+    实测冷缓存切一次要等 267 秒。
+
+    ★ 这里改成**并发**取：串行时 scout 那几份加起来要十几秒，白等。
+      各函数自己带 TTL，多调几次不会多打请求。
     """
-    if PRICE_SOURCE != "scout":
-        return
     steps = (
         ("scout 汇率", lambda: scout_currency_prices(league)),
         ("scout 更新间隔", lambda: scout_probe_interval(league)),
         ("dadsofexile 基准价", lambda: doe_prices(league)),
         ("scout 交易对挂出量", lambda: scout_pair_stocks(league)),
+        ("scout 批量历史", lambda: _scout_bulk_history(league)),
     )
-    for name, fn in steps:
+    failures: list[str] = []
+
+    def run(step: tuple) -> str:
+        name, fn = step
         try:
             fn()
         except Exception as exc:                               # noqa: BLE001
-            # 预热失败不致命： fetch_category 里还有各自的兜底与重试
-            log(f"  · {name}预热失败（不阻断抓取）：{exc}")
+            return f"{name}（{exc}）"
+        return ""
+
+    with ThreadPoolExecutor(max_workers=max(2, len(steps))) as pool:
+        failures = [x for x in pool.map(run, steps) if x]
+    if failures and not quiet:
+        # 预热失败不致命： fetch_category 里还有各自的兜底与重试
+        log(f"  · 预热未完成（不阻断抓取）：{'、'.join(failures)}")
 
 
 def last_snapshot_values(league: str, before_ts: int) -> dict[str, tuple]:
@@ -3459,6 +3544,125 @@ def last_snapshot_values(league: str, before_ts: int) -> dict[str, tuple]:
         for r in rows
         if r["currency_id"]
     }
+
+
+def last_src_values(league: str, before_ts: int) -> dict[tuple[str, str], tuple]:
+    """分源价的去重基线：{(通货, 源): (divine, exalted, chaos)}。
+
+    跟 last_snapshot_values 一个道理——跟「最后一次写入」比，而不是「上一轮」。
+    """
+    try:
+        rows = db().execute(
+            "SELECT currency_id, source, MAX(ts) AS mts, value_divine,"
+            " value_exalted, value_chaos"
+            " FROM snapshot_src WHERE league = ? AND ts < ?"
+            " GROUP BY currency_id, source",
+            (league, before_ts),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - 读不到就当没有基线，本轮照写
+        return {}
+    return {
+        (r["currency_id"], r["source"]): (
+            r["value_divine"], r["value_exalted"], r["value_chaos"],
+        )
+        for r in rows
+        if r["currency_id"]
+    }
+
+
+# ------------------------------------------------- 按取价源读历史（v1.28.0）
+#
+# 三个源各自的价存在 snapshot_src 里（每轮都写），这里只负责按源取。
+# ★ 只有价格来自分源表；挂出量/求购量/成交热度/7 天趋势与「取价源」无关
+#   （分别只有 poe2scout / poe.ninja 提供），一律从 snapshot 那张表借，
+#   免得同一条数据存三份、还多出三套会互相打架的口径。
+SRC_PRICE_KEYS = ("doe", "scout", "ninja")
+SRC_LABELS = {"doe": "dadsofexile", "scout": "poe2scout", "ninja": "poe.ninja"}
+
+
+def src_available(league: str, srckey: str) -> bool:
+    """这个源在库里到底有没有分源价（没有就退回规范行，界面不至于空掉）。"""
+    if srckey not in SRC_PRICE_KEYS:
+        return False
+    try:
+        row = db().execute(
+            "SELECT 1 FROM snapshot_src WHERE league = ? AND source = ? LIMIT 1",
+            (league, srckey),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return False
+    return row is not None
+
+
+def latest_src_price_map(league: str, srckey: str) -> dict[str, tuple[float, float, float]]:
+    """每个通货在该源下「最近一次」的 (divine, exalted, chaos)。"""
+    if srckey not in SRC_PRICE_KEYS:
+        return {}
+    try:
+        rows = db().execute(
+            "SELECT s.currency_id, s.value_divine, s.value_exalted, s.value_chaos"
+            " FROM snapshot_src s"
+            " JOIN (SELECT currency_id, MAX(ts) AS mts FROM snapshot_src"
+            "       WHERE league = ? AND source = ? GROUP BY currency_id) m"
+            "   ON s.currency_id = m.currency_id AND s.ts = m.mts"
+            " WHERE s.league = ? AND s.source = ?",
+            (league, srckey, league, srckey),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        r["currency_id"]: (r["value_divine"], r["value_exalted"], r["value_chaos"])
+        for r in rows
+    }
+
+
+def src_series(league: str, srckey: str, column: str,
+               cutoff: int) -> dict[str, list[tuple[int, float]]]:
+    """该源在窗口内的价格序列：{通货: [(ts, 值)]}，按时间升序。"""
+    out: dict[str, list[tuple[int, float]]] = {}
+    if srckey not in SRC_PRICE_KEYS or column not in BASE_COLUMNS.values():
+        return out
+    try:
+        rows = db().execute(
+            f"SELECT currency_id, ts, {column} AS value FROM snapshot_src"
+            " WHERE league = ? AND source = ? AND ts >= ?"
+            f" AND {column} IS NOT NULL ORDER BY ts ASC",
+            (league, srckey, cutoff),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return out
+    for row in rows:
+        value = row["value"]
+        if value is None or value != value:          # 过滤 NaN
+            continue
+        out.setdefault(row["currency_id"], []).append((row["ts"], value))
+    return out
+
+
+def src_stats(league: str, srckey: str, column: str, cutoff: int) -> dict[str, dict]:
+    """该源在窗口内的 MIN/MAX/AVG/首末值——倒货榜要的那几个统计量。"""
+    if srckey not in SRC_PRICE_KEYS or column not in BASE_COLUMNS.values():
+        return {}
+    sql = f"""
+    WITH ranked AS (
+        SELECT currency_id, ts, {column} AS v,
+               ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts ASC)  AS rn_first,
+               ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts DESC) AS rn_last
+        FROM snapshot_src
+        WHERE league = ? AND source = ? AND ts >= ? AND {column} IS NOT NULL
+    )
+    SELECT currency_id,
+           MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS mean, COUNT(*) AS n,
+           MAX(CASE WHEN rn_first = 1 THEN v END) AS first_v,
+           MAX(CASE WHEN rn_last  = 1 THEN v END) AS last_v,
+           MAX(CASE WHEN rn_first = 1 THEN ts END) AS first_ts
+    FROM ranked GROUP BY currency_id
+    """
+    try:
+        rows = db().execute(sql, [league, srckey, cutoff]).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {r["currency_id"]: r for r in rows}
 
 
 # ★★ 成交热度最多回溯多久。
@@ -3552,6 +3756,8 @@ def take_snapshot(league: str) -> tuple[int, int]:
     """
     ts = int(time.time())
     records: list[tuple] = []
+    # 按取价源分开的那一份（v1.28.0）：三个源各一行，切源时直接读它
+    src_records: list[tuple] = []
     ok_categories: set[str] = set()
 
     def grab(item: tuple[str, str]) -> tuple[str, list | None, str | None]:
@@ -3591,6 +3797,17 @@ def take_snapshot(league: str) -> tuple[int, int]:
                     int(row.get("orders") or 0),
                 )
             )
+            # 三源各存一行：源不可用（这一段算不出来）就不写，
+            # 免得用 0 冒充「这个源说它值 0」（读侧会退回 ninja 口径）。
+            for src_key, triple in (row.get("by_source") or {}).items():
+                if not triple:
+                    continue
+                d_v, e_v, c_v = triple
+                if not (d_v == d_v and e_v == e_v and c_v == c_v):   # 过滤 NaN
+                    continue
+                src_records.append(
+                    (ts, league, category, row["id"], src_key, d_v, e_v, c_v, "local")
+                )
         ok_categories.add(category)
 
     fetched = len(records)
@@ -3613,21 +3830,45 @@ def take_snapshot(league: str) -> tuple[int, int]:
                 records = kept
                 log(f"  · {skipped} 个通货价格与上次记录完全相同，跳过写入（共 {fetched} 个）")
 
-    if not records:
+        # 分源那份同样去重（键是「通货 + 源」，跟规范行是两码事）
+        prev_src = last_src_values(league, ts)
+        if prev_src:
+            kept_src = []
+            for rec in src_records:
+                if prev_src.get((rec[3], rec[4])) == (rec[5], rec[6], rec[7]):
+                    continue
+                kept_src.append(rec)
+            skipped_src = len(src_records) - len(kept_src)
+            if skipped_src:
+                src_records = kept_src
+                log(f"  · {skipped_src} 条分源价与上次相同，跳过写入")
+
+    if not records and not src_records:
         # 抓到了、但一个都没变。这不是失败，只是这段时间行情没动。
         log(f"  ✓ 本轮 {fetched} 个通货价格均无变化，未写入新行")
         return ts, 0
 
     with db() as connection:
-        connection.executemany(
-            "INSERT OR REPLACE INTO snapshot"
-            " (ts, league, category, currency_id, value_divine, value_exalted,"
-            "  value_chaos, volume, trend, spark, stock, orders)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            records,
-        )
+        if records:
+            connection.executemany(
+                "INSERT OR REPLACE INTO snapshot"
+                " (ts, league, category, currency_id, value_divine, value_exalted,"
+                "  value_chaos, volume, trend, spark, stock, orders)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                records,
+            )
+        if src_records:
+            connection.executemany(
+                "INSERT OR REPLACE INTO snapshot_src"
+                " (ts, league, category, currency_id, source, value_divine,"
+                "  value_exalted, value_chaos, origin)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                src_records,
+            )
 
     log(f"  ✓ 已记录 {len(records)} 条报价（{len(ok_categories)} 个类别）")
+    if src_records:
+        log(f"  ✓ 分源价 {len(src_records)} 条（三源各一份，切源时直接读）")
     backfilled = backfill_history(league, ts)
     if backfilled:
         log(f"  ✓ 由 7 天趋势回填了 {backfilled} 条历史价格")
@@ -3735,19 +3976,89 @@ def sync_from_cloud() -> dict:
     #   本机关机的那段时间本机一个点都没有，云端照样全补上。
     grace = max(_clamp_int(CONFIG.get("interval_minutes", 30), 30, 1, 1440) * 60, 300)
 
-    targets: list[int] = []
-    for i, t in enumerate(stamps):
-        ts = int(t)
-        pos = bisect.bisect_left(have, ts)
-        covered = any(
-            0 <= j < len(have) and abs(have[j] - ts) <= grace
-            for j in (pos - 1, pos)
+    def gaps(have_ts: list[int]) -> list[int]:
+        """这些云端时间点里，本机（给定的那组已有时间戳）没覆盖到的下标。"""
+        out: list[int] = []
+        for i, t in enumerate(stamps):
+            ts = int(t)
+            pos = bisect.bisect_left(have_ts, ts)
+            covered = any(
+                0 <= j < len(have_ts) and abs(have_ts[j] - ts) <= grace
+                for j in (pos - 1, pos)
+            )
+            if not covered:
+                out.append(i)
+        return out
+
+    targets = gaps(have)
+
+    # ★★ 分源那几段单独判「缺不缺」（v1.28.0）。
+    #    必须在下面的提前返回**之前**算：老版本（1.27.x）攒下的历史里根本没有分源价，
+    #    按规范行判会得出「本机已覆盖」→ 分源历史永远补不进来，切源又回到没数据的窘境。
+    src_payload = payload.get("src") if isinstance(payload.get("src"), dict) else {}
+    src_targets: dict[str, list[int]] = {}
+    src_have: dict[str, list[int]] = {}
+    for _key in SRC_PRICE_KEYS:
+        _sec = src_payload.get(_key) or {}
+        if not (_sec.get("items") or {}):
+            continue
+        src_have[_key] = sorted(
+            int(row["ts"]) for row in db().execute(
+                "SELECT DISTINCT ts FROM snapshot_src WHERE league = ? AND source = ?",
+                (league, _key),
+            ).fetchall()
         )
-        if not covered:
-            targets.append(i)
+        _t = gaps(src_have[_key])
+        if _t:
+            src_targets[_key] = _t
+
+    def write_src() -> int:
+        """把云端三段分源价补进 snapshot_src，返回补入条数。"""
+        out: list[tuple] = []
+        for _key, _idxs in src_targets.items():
+            _items = (src_payload.get(_key) or {}).get("items") or {}
+            for idx in _idxs:
+                ts = int(stamps[idx])
+                for cid, item in _items.items():
+                    def _pick(k: str, _it=item, _i=idx) -> object:
+                        arr = _it.get(k) or []
+                        return arr[_i] if _i < len(arr) else None
+
+                    if _pick("e") is None:       # 该点没价，跳过
+                        continue
+                    out.append(
+                        (ts, league, str(item.get("cat") or ""), str(cid), _key,
+                         _pick("d"), _pick("e"), _pick("c"), "cloud")
+                    )
+        if not out:
+            return 0
+        _keys = sorted({rec[4] for rec in out})
+        # ⚠️ 只补「本机一条分源行都没有」的那些时间点，不做整体替换：
+        #    本机自己算的那份更贴近本机此刻的口径，别被云端覆盖。
+        _have_pairs = {
+            (int(r["ts"]), str(r["source"])) for r in db().execute(
+                "SELECT DISTINCT ts, source FROM snapshot_src WHERE league = ?",
+                (league,),
+            ).fetchall()
+        }
+        out = [rec for rec in out if (rec[0], rec[4]) not in _have_pairs]
+        if not out:
+            return 0
+        with db() as connection:
+            connection.executemany(
+                "INSERT OR REPLACE INTO snapshot_src"
+                " (ts, league, category, currency_id, source, value_divine,"
+                "  value_exalted, value_chaos, origin)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                out,
+            )
+        log(f"  ✓ 分源价补入 {len(out)} 条（{'/'.join(_keys)}）")
+        return len(out)
+
+    src_added = write_src()
 
     if not targets:
-        return {"ok": True, "added": 0, "points": 0,
+        return {"ok": True, "added": 0, "points": 0, "src_added": src_added,
                 "note": "本机已覆盖云端这些时段（本机高频优先）"}
 
     records: list[tuple] = []
@@ -3790,7 +4101,8 @@ def sync_from_cloud() -> dict:
                 records,
             )
     log(f"  ✓ 云端补入 {len(records)} 条（本机缺 {len(targets)} 个时间点）")
-    return {"ok": True, "added": len(records), "points": len(targets)}
+    return {"ok": True, "added": len(records), "points": len(targets),
+            "src_added": src_added}
 
 
 # ------------------------------------------------- 离线空档：用 scout 历史自补
@@ -4105,7 +4417,7 @@ class SourceWarmer(threading.Thread):
     def warm_once(self) -> dict:
         """拉一轮并塞进缓存，返回各源拿到的条目数（自检直接调它，不用起线程）。"""
         league = str(STATE.get("league") or "")
-        out = {"doe": 0, "scout": 0, "ninja": 0, "scout_hist": 0}
+        out = {"doe": 0, "scout": 0, "ninja": 0, "scout_hist": 0, "scout_pairs": 0}
         if not league:
             return out
 
@@ -4128,6 +4440,13 @@ class SourceWarmer(threading.Thread):
             out["scout"] = len(scout_currency_prices(league) or {})
         except Exception as exc:                                   # noqa: BLE001
             log(f"  · 预热：poe2scout 价格没取到（不影响使用）：{exc}")
+        # 挂出量/求购量（全交易所交易对快照）与更新间隔：fetch_category 每轮都要用，
+        # 不预热的话抓一轮里每个类别都会去等它（有单飞，但第一个等的人最慢）。
+        try:
+            out["scout_pairs"] = len(scout_pair_stocks(league)[0] or {})
+            scout_probe_interval(league)
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 预热：poe2scout 挂出量没取到（不影响使用）：{exc}")
         try:
             # ⚠️ URL 必须跟 fetch_category 里**一模一样**，否则缓存键对不上、
             #    预热存的和抓取查的是两个 key，等于白预热一遍。
@@ -4592,9 +4911,51 @@ class SpreadWorker(threading.Thread):
 
 # --------------------------------------------------------------------- 服务层
 
-def rows_to_items(base: str, category: str, query: str, hours: int) -> dict:
-    """组装列表接口数据：当前值 + 区间涨跌 + 迷你走势。"""
+def price_source_key(requested: str = "") -> str:
+    """把请求里的源解析成「该读哪张表」的键（v1.28.0）。
+
+    返回 "" = 读规范行（snapshot 表）；'doe' / 'scout' / 'ninja' = 读分源表。
+    auto 也走规范行——那一行本来就是「按优先级挑一个源」算出来的结果。
+
+    ★ 库里还没有这个源的分源价时（刚装上 / 云端还没补到这一段）也退回规范行：
+      宁可显示当前口径的价，也不要让界面整片空白。
+    """
+    key = str(requested or "").strip().lower()
+    if key in ("", "auto"):
+        key = primary_source()
+        if key == "auto":
+            return ""
+    if key not in SRC_PRICE_KEYS:
+        return ""
+    return key if src_available(str(STATE.get("league") or ""), key) else ""
+
+
+def merge_src_prices(rows: list, league: str, srckey: str) -> list[dict]:
+    """把分源价并进规范行：价取该源的，其余列（量/趋势/挂出量）仍用规范行。
+
+    ⚠️ 该源没有这个通货的价时，退回规范行的价（而不是留空）——分源表只覆盖
+      该源取到价的那部分通货，缺的用当前口径补，界面上不会出现空洞。
+    """
+    prices = latest_src_price_map(league, srckey) if srckey else {}
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        triple = prices.get(d.get("currency_id"))
+        if triple and triple[0] is not None:
+            d["value_divine"], d["value_exalted"], d["value_chaos"] = triple
+        out.append(d)
+    return out
+
+
+def rows_to_items(base: str, category: str, query: str, hours: int,
+                  source: str = "") -> dict:
+    """组装列表接口数据：当前值 + 区间涨跌 + 迷你走势。
+
+    source 为空 / auto → 规范行（当前优先级挑出来的那一行）；
+    指定 doe / scout / ninja → 该源自己的分源价与历史（切源即时生效靠的就是它）。
+    """
     column = BASE_COLUMNS[base]
+    srckey = price_source_key(source)
     latest_ts_row = db().execute(
         "SELECT MAX(ts) AS ts FROM snapshot WHERE league = ?", (STATE["league"],)
     ).fetchone()
@@ -4612,20 +4973,24 @@ def rows_to_items(base: str, category: str, query: str, hours: int) -> dict:
          "s.value_exalted", "s.volume", "s.trend", "s.spark"],
         category,
     )
+    latest_rows = merge_src_prices(latest_rows, STATE["league"], srckey)
 
-    sql_series = (
-        f"SELECT currency_id, ts, {column} AS value FROM snapshot"
-        " WHERE league = ? AND ts >= ?"
-        # 同 arbitrage_rows：日线 synthetic 点不能进区间涨跌的计算
-        " AND (source IS NULL OR source != 'synthetic')"
-        " ORDER BY ts ASC"
-    )
-    series: dict[str, list[tuple[int, float]]] = {}
-    for row in db().execute(sql_series, [STATE["league"], cutoff]).fetchall():
-        value = row["value"]
-        if value is None or value != value:  # 过滤 NaN
-            continue
-        series.setdefault(row["currency_id"], []).append((row["ts"], value))
+    if srckey:
+        series = src_series(STATE["league"], srckey, column, cutoff)
+    else:
+        sql_series = (
+            f"SELECT currency_id, ts, {column} AS value FROM snapshot"
+            " WHERE league = ? AND ts >= ?"
+            # 同 arbitrage_rows：日线 synthetic 点不能进区间涨跌的计算
+            " AND (source IS NULL OR source != 'synthetic')"
+            " ORDER BY ts ASC"
+        )
+        series = {}
+        for row in db().execute(sql_series, [STATE["league"], cutoff]).fetchall():
+            value = row["value"]
+            if value is None or value != value:  # 过滤 NaN
+                continue
+            series.setdefault(row["currency_id"], []).append((row["ts"], value))
 
     meta_rows = {
         row["currency_id"]: row
@@ -4872,6 +5237,11 @@ def build_meta(base: str, latest_ts: int, count: int) -> dict:
             max(0, (now - source_updated) // 60) if source_updated else None
         ),
         "source": source_name,
+        # ★ 用户选的取价源 vs 这一轮实际用上的源（v1.28.0）。
+        #   两者不一样时必须让界面说得出来：比如选了 poe2scout，但它停更被闸门挡掉，
+        #   本轮其实用的是 dadsofexile —— 不说清楚，用户只会觉得「切了源没生效」。
+        "primary_source": primary_source(),
+        "basis": str(_LAST_BASIS.get(state["league"]) or ""),
         "fetching": state["running"],
         "error": state["last_error"],
         # 展示的是实际生效的节奏（自动调整后可能比 config 里写的长）
@@ -4991,13 +5361,16 @@ def _history_shell(currency_id, meta, ex_pts, ch_pts, dv_pts, src, gran) -> dict
     }
 
 
-def query_history(currency_id: str, hours: int, src: str = "db") -> dict:
+def query_history(currency_id: str, hours: int, src: str = "db",
+                  source: str = "") -> dict:
     """返回某个通货在三种基准下的历史序列，供详情弹窗切换查看。
 
     src:
       db    = 本机记录（默认；本机 5 分钟一采，覆盖 646 种通货）
       scout = 直接问 poe2scout 要（小时级，最近 24 小时）
       ninja = 从 poe.ninja 的 7 天 sparkline 反推（日线）
+    source:
+      取价源。指定 doe / scout / ninja 时，db 那份读的是该源自己的历史。
     """
     meta = db().execute(
         "SELECT * FROM item_meta WHERE currency_id = ?", (currency_id,)
@@ -5015,11 +5388,24 @@ def query_history(currency_id: str, hours: int, src: str = "db") -> dict:
             log(f"  · 取 poe.ninja 历史失败（{exc}），退回本机记录")
 
     cutoff = int(time.time()) - hours * 3600
-    rows = db().execute(
-        "SELECT ts, value_exalted, value_chaos, value_divine, source FROM snapshot"
-        " WHERE league = ? AND currency_id = ? AND ts >= ? ORDER BY ts ASC",
-        (STATE["league"], currency_id, cutoff),
-    ).fetchall()
+    # ★ 选了具体取价源时，「本机记录」给的就是该源自己那份历史（v1.28.0）：
+    #   以前这里永远读规范行，于是切到 scout 后曲线还是 doe 口径的，
+    #   看起来「切了源什么都没变」。
+    srckey = price_source_key(source)
+    if srckey:
+        rows = db().execute(
+            "SELECT ts, value_exalted, value_chaos, value_divine, source"
+            " FROM snapshot_src"
+            " WHERE league = ? AND source = ? AND currency_id = ? AND ts >= ?"
+            " ORDER BY ts ASC",
+            (STATE["league"], srckey, currency_id, cutoff),
+        ).fetchall()
+    else:
+        rows = db().execute(
+            "SELECT ts, value_exalted, value_chaos, value_divine, source FROM snapshot"
+            " WHERE league = ? AND currency_id = ? AND ts >= ? ORDER BY ts ASC",
+            (STATE["league"], currency_id, cutoff),
+        ).fetchall()
 
     def series(column: str) -> list[list[float]]:
         out: list[list[float]] = []
@@ -5030,12 +5416,18 @@ def query_history(currency_id: str, hours: int, src: str = "db") -> dict:
             out.append([row["ts"], value])
         return out
 
+    label = f"本机记录（{INTERVAL_SECONDS // 60} 分钟一采）"
+    if srckey:
+        label = (f"本机记录 · {SRC_LABELS[srckey]} 口径"
+                 f"（{INTERVAL_SECONDS // 60} 分钟一采）")
     result = _history_shell(
         currency_id, meta,
         series("value_exalted"), series("value_chaos"), series("value_divine"),
-        "db", f"本机记录（{INTERVAL_SECONDS // 60} 分钟一采）",
+        "db", label,
     )
-    result["synthetic_points"] = sum(1 for row in rows if row["source"] == "synthetic")
+    result["synthetic_points"] = (
+        0 if srckey else sum(1 for row in rows if row["source"] == "synthetic")
+    )
     return result
 
 
@@ -5877,8 +6269,12 @@ def arb_score(
     return chance * (0.25 + 0.75 * heat) * confidence * 100.0
 
 
-def arbitrage_rows(base: str, category: str, query: str, hours: int) -> dict:
+def arbitrage_rows(base: str, category: str, query: str, hours: int,
+                   source: str = "") -> dict:
     """倒货盈利榜：基于本机每小时历史，算出每个通货的低买高卖空间。
+
+    source 指定 doe / scout / ninja 时，价与历史都走该源自己的那份
+    （区间涨跌跟着源一起变，这正是「切换源后下面每一列都要变」的要求）。
 
     注意：汇率源（dadsofexile / poe2scout / poe.ninja）每种通货只有一个聚合价
     （无买/卖价差），所以「同一时刻三种货币转一圈」恒等于 0% 盈亏；
@@ -5895,30 +6291,34 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int) -> dict:
     latest_ts = int(latest_ts_row["ts"])
     cutoff = latest_ts - hours * 3600
 
-    sql = f"""
-    WITH ranked AS (
-        SELECT currency_id, ts, {column} AS v,
-               ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts ASC)  AS rn_first,
-               ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts DESC) AS rn_last
-        FROM snapshot
-        WHERE league = ? AND ts >= ? AND {column} IS NOT NULL
-          -- ⚠️ 必须排除 synthetic：那是 poe.ninja 7 天 sparkline 反推出来的**日线**点
-          -- （一天一个）。混进来会让「现在 vs 昨天」冒充日内振幅，离线后真实点一少，
-          -- 它还会拿来凑满 n=2 硬上榜，算出的波动完全不是日内波动。
-          -- cloud 是云端真实抓取的，正常计入。
-          AND (source IS NULL OR source != 'synthetic')
-    )
-    SELECT currency_id,
-           MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS mean, COUNT(*) AS n,
-           MAX(CASE WHEN rn_first = 1 THEN v END) AS first_v,
-           MAX(CASE WHEN rn_last  = 1 THEN v END) AS last_v,
-           MAX(CASE WHEN rn_first = 1 THEN ts END) AS first_ts
-    FROM ranked GROUP BY currency_id
-    """
-    stats = {
-        row["currency_id"]: row
-        for row in db().execute(sql, [STATE["league"], cutoff]).fetchall()
-    }
+    srckey = price_source_key(source)
+    if srckey:
+        stats = src_stats(STATE["league"], srckey, column, cutoff)
+    else:
+        sql = f"""
+        WITH ranked AS (
+            SELECT currency_id, ts, {column} AS v,
+                   ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts ASC)  AS rn_first,
+                   ROW_NUMBER() OVER (PARTITION BY currency_id ORDER BY ts DESC) AS rn_last
+            FROM snapshot
+            WHERE league = ? AND ts >= ? AND {column} IS NOT NULL
+              -- ⚠️ 必须排除 synthetic：那是 poe.ninja 7 天 sparkline 反推出来的**日线**点
+              -- （一天一个）。混进来会让「现在 vs 昨天」冒充日内振幅，离线后真实点一少，
+              -- 它还会拿来凑满 n=2 硬上榜，算出的波动完全不是日内波动。
+              -- cloud 是云端真实抓取的，正常计入。
+              AND (source IS NULL OR source != 'synthetic')
+        )
+        SELECT currency_id,
+               MIN(v) AS lo, MAX(v) AS hi, AVG(v) AS mean, COUNT(*) AS n,
+               MAX(CASE WHEN rn_first = 1 THEN v END) AS first_v,
+               MAX(CASE WHEN rn_last  = 1 THEN v END) AS last_v,
+               MAX(CASE WHEN rn_first = 1 THEN ts END) AS first_ts
+        FROM ranked GROUP BY currency_id
+        """
+        stats = {
+            row["currency_id"]: row
+            for row in db().execute(sql, [STATE["league"], cutoff]).fetchall()
+        }
 
     latest_rows = latest_snapshot_rows(
         STATE["league"],
@@ -5926,6 +6326,7 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int) -> dict:
          "s.value_exalted", "s.volume",
          "COALESCE(s.stock, 0) AS stock", "COALESCE(s.orders, 0) AS orders"],
     )
+    latest_rows = merge_src_prices(latest_rows, STATE["league"], srckey)
     meta_rows = {
         row["currency_id"]: row
         for row in db().execute("SELECT * FROM item_meta").fetchall()
@@ -6182,15 +6583,20 @@ class Handler(BaseHTTPRequestHandler):
             value = str((body or {}).get("source") or "").strip().lower()
             before = primary_source()
             now = set_primary_source(value)
-            # ★ 换源必须立刻重抓一轮（2026-10-01）：
-            #   主源变了，库里那批价还是按旧源算的，不重抓的话界面要等到下一个
-            #   采集周期（5 分钟）才会变——用户切完源看到价格纹丝不动，
-            #   只会以为切换没生效。这里唤醒抓取线程立刻按新源抓一轮。
+            # ★★ 切源现在是**本地换表**，不等任何网络请求（v1.28.0）。
+            #   每轮抓取都把三个源各自的价写进了 snapshot_src，所以这里只要
+            #   告诉前端「去读哪个源」就行——当前价、区间涨跌、曲线一起变。
+            #   （改之前要么等下一个采集周期，要么让用户干等一次全量重抓：
+            #     实测冷缓存那次要 267 秒，界面上就是「切了源价格纹丝不动」。）
+            key = price_source_key(now)
+            # 兜底：该源的历史还没攒到（刚装上 / 云端还没补到）→ 让抓取线程
+            # 立刻跑一轮，把三源都写一遍；前端据此短暂等待并提示。
             worker = getattr(self.server, "worker", None)
-            if worker and now != before and hasattr(worker, "wake"):
+            ready = (now == "auto") or bool(key)
+            if worker and (now != before or not ready) and hasattr(worker, "wake"):
                 worker.wake.set()
-            self._json({"ok": True, "source": now, "refetching": bool(
-                worker and now != before and hasattr(worker, "wake"))})
+            self._json({"ok": True, "source": now, "ready": ready,
+                        "local_key": key})
         except Exception as exc:                                # noqa: BLE001
             log(f"接口异常 {parsed.path}: {exc}")
             self._json({"error": str(exc)}, status=500)
@@ -6224,7 +6630,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self._json(
                     rows_to_items(
-                        base, args.get("category", ["all"])[0], args.get("q", [""])[0], hours
+                        base, args.get("category", ["all"])[0],
+                        args.get("q", [""])[0], hours,
+                        args.get("source", [""])[0],
                     )
                 )
             elif path.startswith("/api/spread"):
@@ -6261,6 +6669,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(query_history(
                     args.get("id", [""])[0], hours,
                     args.get("src", ["db"])[0],
+                    args.get("source", [""])[0],
                 ))
             elif path.startswith("/api/uniques"):
                 if path == "/api/uniques/history":
@@ -6300,7 +6709,9 @@ class Handler(BaseHTTPRequestHandler):
                 hours = _safe_int(args.get("hours", ["24"])[0], 24, 1, 24 * RETENTION_DAYS)
                 self._json(
                     arbitrage_rows(
-                        base, args.get("category", ["all"])[0], args.get("q", [""])[0], hours
+                        base, args.get("category", ["all"])[0],
+                        args.get("q", [""])[0], hours,
+                        args.get("source", [""])[0],
                     )
                 )
             elif path.startswith("/api/switch"):
@@ -6318,9 +6729,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "league": STATE["league"]}, status=400)
             elif path == "/api/source":
                 # 取价主源。切换走 POST（见 do_POST），这里只负责告诉前端有哪些可选。
+                _cur = primary_source()
                 self._json({
-                    "source": primary_source(),
+                    "source": _cur,
                     "default": PRIMARY_SOURCE_DEFAULT,
+                    # 该源的分源价库里有没有（v1.28.0）：没有时界面短暂等一轮抓取
+                    "ready": (_cur == "auto") or src_available(
+                        str(STATE.get("league") or ""), _cur),
                     "options": [
                         {"value": "auto", "label": "自动（doe 优先，覆盖最全）"},
                         {"value": "doe", "label": "dadsofexile"},
