@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.28.0"
+VERSION = "1.28.1"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -1375,6 +1375,17 @@ DOE_TIMEOUT = 15              # 个人小站，别让它卡住整轮抓取
 DOE_BRIDGED_SRC = "exchange-bridged"
 # 数据来源：https://dadsofexile.com/api/prices 的 price_source 字段
 
+# ★★ doe 的个别报价会离谱到几百倍（2026-10-02 用户反馈「数据和实际偏差有点大」后实测）：
+#     534 个 doe 报价里有 50 个（9.4%）与 poe.ninja、poe2scout **同时**差 3 倍以上，
+#     而且方向一致 —— 典型如 lesser-essence-of-haste：doe 1061 崇高，
+#     而 ninja 2.0 / scout 2.0 崇高（差 529 倍）；essence-of-command 差 322 倍。
+#     两家都不同意它时，它就是脏的，没有第三种可能。
+#   ⚠️ 这是 doe 源**内部**的判据（跟 order_book 那几档并列），
+#      不动「doe > poe2scout > poe.ninja」的取价优先级：
+#      只把这条 doe 报价判成不可采信，本条回落到下一档，其余照旧。
+DOE_OUTLIER_RATIO = 3.0     # 两个源都不同意 doe 时的倍差门槛
+DOE_OUTLIER_SOLO = 5.0      # 只有一个源可比时放宽：单个源自己也可能不准，别急着判 doe
+
 DOE_INTERVAL_SECONDS = 30 * 60   # 实测几分钟到二十分钟刷一次，取 30 分钟当保守标称
 # 标记间隔是 30 分钟，超过这个时长还没刷新就认为它「僵住了」：
 # 它是个人小站，抽风时会一直返回同一份陈旧数据（价格看着正常但其实不动了）。
@@ -2672,6 +2683,14 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         return 1.0 if primary == name else float("nan")
 
     f_exalted, f_chaos, f_divine = factor("exalted"), factor("chaos"), factor("divine")
+    # ★★ ninja 自己的尺子必须在这里先留底（v1.28.1 修复）。
+    #    下面「用户选定的主源」那一段会用 doe / scout 的基准货币**覆盖** f_*，
+    #    而 ninja 那一套价要用的是**它自己**的系数。混着算等于
+    #    「poe.ninja 的价 × dadsofexile 的汇率」——切到 poe.ninja 源看到的
+    #    根本不是 ninja 的口径。
+    #    实测症状：三源的汇率尺子完全一致（ninja 与 doe 偏差 0.0%），
+    #    因为 ninja 那份从头到尾就没用过自己的尺子。
+    ninja_f = (f_divine, f_exalted, f_chaos)
     # 记一笔 ninja 汇率指纹：它响应里没有时间戳，判断它活不活跃只能看数据变没变
     ninja_note_rates(league, rates)
     # ⚠️ ninja 没给汇率时 factor() 会返回 nan（自检里用假联盟就复现了），
@@ -2940,6 +2959,8 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         f_chaos = s_div / s_ch
 
     rows: list[dict] = []
+    # 本轮被判成离群的 dadsofexile 报价（只用于日志，不写进任何一行）
+    outliers: list[tuple[str, float, float]] = []
     for line in payload.get("lines") or []:
         primary_value = float(line.get("primaryValue") or 0.0)
         if primary_value <= 0:
@@ -2952,21 +2973,55 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         # ⚠️ scout 那一档必须带 scout_fresh：它停更时还留着数据，
         #    不摘掉就永远挡住更新的 ninja（2026-09-29 事故）。
         doe_row = doe.get(cid)
+
+        # ninja 口径：它自己的价 × **它自己的**系数（三家都有，永远兜得住）。
+        # ⚠️ 必须用上面留底的 ninja_f：此刻的 f_* 已经被主源（doe/scout）覆盖了，
+        #    拿它换算就变成「ninja 的价 × 别人的汇率」（v1.28.1 修复）。
+        ninja_view = (
+            primary_value * ninja_f[0],
+            primary_value * ninja_f[1],
+            primary_value * ninja_f[2],
+        )
+        # scout 口径（同样用 scout 自己的尺子）—— 上面 ninja 那份已经算出来了，
+        # 这里提前算是为了给下面的「doe 离群检测」当第二个参照。
+        _sp0 = scout.get(cid)
+        scout_view = (
+            (_sp0 / s_div, _sp0 / s_ex, _sp0 / s_ch)
+            if (_sp0 and scout_fresh and s_div > 0 and s_ch > 0 and s_ex > 0)
+            else None
+        )
+
+        # 取价优先级：dadsofexile（挂单够 / 桥接价，且非假价）> poe2scout（新鲜时）> poe.ninja。
+        # 用谁的价就必须用谁的基准货币，混着算会自相矛盾（这是踩过的坑）。
+        # ⚠️ scout 那一档必须带 scout_fresh：它停更时还留着数据，
+        #    不摘掉就永远挡住更新的 ninja（2026-09-29 事故）。
+        #
+        # ★★ doe 的离群检测（v1.28.1）：与另两个源**同时**差好几倍且方向一致 →
+        #    这条就是脏的，本条不采信它，回落到下一档。
+        #    实测 534 条里 50 条（9.4%）中招，典型是差 300~500 倍，
+        #    用户看到的「数据和实际偏差有点大」主要就是这批。
+        _take_doe = bool(doe_row and doe_row.get("ok") and use_doe_base)
+        if _take_doe and d_ex > 0:
+            _doe_ex = float(doe_row["price"]) / d_ex
+            # ⚠️ scout_view 是三元组或 None，None 时不能拿短元组去取 [1]（会越界）
+            _refs_raw = [ninja_view[1]] + ([scout_view[1]] if scout_view else [])
+            _refs = [v for v in _refs_raw
+                     if isinstance(v, (int, float)) and v == v and v > 0]
+            if _doe_ex > 0 and _refs:
+                _need = DOE_OUTLIER_RATIO if len(_refs) >= 2 else DOE_OUTLIER_SOLO
+                if all((_doe_ex / v >= _need) or (v / _doe_ex >= _need)
+                       for v in _refs):
+                    _take_doe = False
+                    outliers.append((cid, _doe_ex, max(_refs, key=lambda x: x)))
+
         price = None
         base_div = base_ch = base_ex = 0.0
-        if doe_row and doe_row.get("ok") and use_doe_base:
+        if _take_doe:
             price = doe_row["price"]
             base_div, base_ch, base_ex = d_div, d_ch, d_ex
-        elif scout_fresh and scout.get(cid) and s_div > 0 and s_ch > 0 and s_ex > 0:
-            price = scout[cid]
+        elif scout_view:
+            price = _sp0
             base_div, base_ch, base_ex = s_div, s_ch, s_ex
-
-        # ninja 口径：它自己的价 × 它自己的系数（三家都有，永远兜得住）
-        ninja_view = (
-            primary_value * f_divine,
-            primary_value * f_exalted,
-            primary_value * f_chaos,
-        )
 
         if price and base_div > 0 and base_ch > 0 and base_ex > 0:
             divine = price / base_div
@@ -2979,7 +3034,11 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
         #    doe/scout 各自的基准货币当尺子，用谁的价就用谁的尺子；
         #    该源此刻不可用（doe 没有这条 / scout 停更）就算不出来，存 None，
         #    读侧会退回 ninja 口径，绝不拿别的源的价冒充。
-        by_source: dict[str, tuple | None] = {"ninja": ninja_view}
+        # ninja 这一份在它没给汇率时是 nan（假联盟实测过），不能写进分源表——
+        # 写进去就是拿一堆 nan 冒充「poe.ninja 的价」。宁可留空让读侧退回规范行。
+        by_source: dict[str, tuple | None] = {
+            "ninja": ninja_view if ninja_rates_ok else None
+        }
         _dr = _full_doe.get(cid)
         by_source["doe"] = (
             (_dr["price"] / fd_div, _dr["price"] / fd_ex, _dr["price"] / fd_ch)
@@ -3015,6 +3074,14 @@ def fetch_category(league: str, category: str) -> tuple[list[dict], float, float
                 "stock": bid_v,
                 "orders": ask_v,
             }
+        )
+    if outliers:
+        log_once(
+            f"doe-outlier:{league}",
+            f"  · dadsofexile 有 {len(outliers)} 条报价与另外两个源差 "
+            f"{DOE_OUTLIER_RATIO:g} 倍以上（例如 {outliers[0][0]}："
+            f"doe {outliers[0][1]:.4g} 崇高 vs 其它源 {outliers[0][2]:.4g}），"
+            f"这些条目本轮改用下一个源的价",
         )
     return rows, f_exalted, f_chaos, f_divine
 
@@ -5000,6 +5067,11 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
     labels = dict(CATEGORIES)
     items: list[dict] = []
     no_zh = 0
+    # ★ 三个基准货币互相的兑换比例（v1.28.1）：界面把它显示在「基准货币」那一排，
+    #   让人一眼看到「1 神圣 = ? 崇高 = ? 混沌」。
+    #   ⚠️ 取自已经按源替换过价的 latest_rows，所以切源时它跟着变——
+    #      汇率是整套折算的尺子，三个源各有一把，显示必须和当前口径一致。
+    base_rates: dict[str, dict[str, float]] = {}
     for row in latest_rows:
         cid = row["currency_id"]
         # 三种基准同时给出，前端可以直接对比换算
@@ -5008,6 +5080,9 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
             "chaos": row["value_chaos"],
             "divine": row["value_divine"],
         }
+        if cid in CALC_BASES:
+            base_rates[cid] = {k: v for k, v in values.items()
+                               if isinstance(v, (int, float)) and v == v and v > 0}
         value = values.get(base)
         if value is None or value != value:
             continue
@@ -5080,6 +5155,8 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
         )
     meta = build_meta(base, latest_ts, len(items))
     meta["no_zh"] = no_zh
+    # 三个基准货币互相的兑换比例；缺一个就不给（宁可不显示，也不给半套比例）
+    meta["rates"] = base_rates if len(base_rates) == len(CALC_BASES) else None
     return {"meta": meta, "items": items}
 
 
@@ -6337,6 +6414,19 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int,
     hidden_small = 0
     hidden_low_stock = 0
     no_zh = 0
+    # ★ 三个基准货币互相的兑换比例（v1.28.1）：倒货榜和汇率看板共用那一排
+    #   基准货币按钮，比例显示必须跟着源走——取自已按源替换过价的 latest_rows。
+    base_rates: dict[str, dict[str, float]] = {}
+    for row in latest_rows:
+        cid = row["currency_id"]
+        if cid in CALC_BASES:
+            base_rates[cid] = {
+                k: v for k, v in (
+                    ("exalted", row["value_exalted"]),
+                    ("chaos", row["value_chaos"]),
+                    ("divine", row["value_divine"]),
+                ) if isinstance(v, (int, float)) and v == v and v > 0
+            }
     for row in latest_rows:
         cid = row["currency_id"]
         stat = stats.get(cid)
@@ -6464,6 +6554,7 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int,
     )
     meta = build_meta(base, latest_ts, sum(1 for i in items if not i["cold"]))
     meta["no_zh"] = no_zh
+    meta["rates"] = base_rates if len(base_rates) == len(CALC_BASES) else None
     meta["arb"] = {
         "min_value": ARB_MIN_VALUE,
         "hidden_small": hidden_small,
