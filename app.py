@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.28.2"
+VERSION = "1.28.3"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -5438,6 +5438,207 @@ def _history_shell(currency_id, meta, ex_pts, ch_pts, dv_pts, src, gran) -> dict
     }
 
 
+# ------------------------------------------- 倒货榜的缩略曲线（v1.28.3）
+#
+# 为什么单独开一个接口，而不是塞进 /api/arbitrage：
+#   倒货榜一屏几十上百行，每行都带一条曲线会把主请求撑到几百 KB，
+#   换筛选条件（排序、现价区间…）时这些曲线全都要跟着重传一次——
+#   而它们大概率根本没变。所以主请求只管算榜单，缩略图单独批量拉。
+
+SPARK_MAX_IDS = 300      # 一次最多取多少个通货
+SPARK_MAX_POINTS = 40    # 每个通货最多多少个点
+
+
+def _spark_thin(points: list[list[float]]) -> list[list[float]]:
+    """把序列抽稀到 SPARK_MAX_POINTS 个点（首尾必留）。
+
+    缩略图只有 72×22 像素，几百个点既画不出差别，还要多传几百 KB。
+    均匀取样会漏掉尖刺，但小图看的是形状，可以接受。
+    """
+    n = len(points)
+    if n <= SPARK_MAX_POINTS:
+        return points
+    step = (n - 1) / (SPARK_MAX_POINTS - 1)
+    return [points[round(i * step)] for i in range(SPARK_MAX_POINTS)]
+
+
+def _spark_from_db(ids: list[str], column: str, cutoff: int,
+                   srckey: str) -> dict[str, list[list[float]]]:
+    """本机记录：一次 SQL 把这批通货在窗口内的点全取回来再分组。
+
+    ⚠️ ids 只走参数化占位符，column 只取 BASE_COLUMNS 白名单里的值。
+    """
+    league = str(STATE.get("league") or "")
+    marks = ",".join("?" * len(ids))
+    try:
+        if srckey:
+            rows = db().execute(
+                "SELECT currency_id, ts, {c} AS v FROM snapshot_src"
+                " WHERE league = ? AND source = ? AND ts >= ?"
+                " AND currency_id IN ({m}) AND {c} IS NOT NULL"
+                " ORDER BY currency_id, ts ASC".format(c=column, m=marks),
+                [league, srckey, cutoff, *ids],
+            ).fetchall()
+        else:
+            rows = db().execute(
+                "SELECT currency_id, ts, {c} AS v FROM snapshot"
+                " WHERE league = ? AND ts >= ? AND currency_id IN ({m})"
+                " AND {c} IS NOT NULL ORDER BY currency_id, ts ASC".format(
+                    c=column, m=marks),
+                [league, cutoff, *ids],
+            ).fetchall()
+    except Exception as exc:                                       # noqa: BLE001
+        log(f"  · 取缩略曲线失败（{exc}）")
+        return {}
+    out: dict[str, list[list[float]]] = {}
+    for row in rows:
+        value = row["v"]
+        if value is None or value != value:      # 过滤 NaN
+            continue
+        out.setdefault(row["currency_id"], []).append(
+            [int(row["ts"]), float(value)])
+    return {cid: _spark_thin(pts) for cid, pts in out.items()}
+
+
+def _spark_from_scout(ids: list[str], base: str,
+                      cutoff: int) -> dict[str, list[list[float]]]:
+    """poe2scout：批量端点一次拿全市场（带 20 分钟缓存），这里只做切片。
+
+    换算跟 _history_from_scout 一致：批量那份是 exalted 计价，
+    混沌 / 神圣用同一时间网格上基准货币的价折出来。
+    """
+    league = str(STATE.get("league") or "")
+    bulk = _scout_bulk_history(league)
+    if not bulk:
+        return {}
+    div = bulk.get("divine") or {}
+    ch = bulk.get("chaos") or {}
+    out: dict[str, list[list[float]]] = {}
+    for cid in ids:
+        hist = bulk.get(cid)
+        if not hist:
+            continue
+        pts: list[list[float]] = []
+        for ts in sorted(hist):
+            if ts < cutoff:
+                continue
+            ex = hist[ts]
+            if base == "chaos":
+                ref = ch.get(ts)
+                if not ref:
+                    continue
+                pts.append([int(ts), float(ex / ref)])
+            elif base == "divine":
+                ref = div.get(ts)
+                if not ref:
+                    continue
+                pts.append([int(ts), float(ex / ref)])
+            else:
+                pts.append([int(ts), float(ex)])
+        if pts:
+            out[cid] = _spark_thin(pts)
+    return out
+
+
+def _spark_from_ninja(ids: list[str], base: str,
+                      cutoff: int) -> dict[str, list[list[float]]]:
+    """poe.ninja：overview 里每个通货都自带 sparkline，一次请求全拿到。
+
+    反推方式与 _history_from_ninja 完全相同（日线，只能当趋势看）。
+    """
+    league = str(STATE.get("league") or "")
+    url = (
+        f"{NINJA_API}/exchange/current/overview"
+        f"?league={urllib.parse.quote(league)}&type={urllib.parse.quote('Currency')}"
+    )
+    payload = ninja_cached(url)
+    rates = (payload.get("core") or {}).get("rates") or {}
+    n_ex = float(rates.get("exalted") or 0.0)
+    n_ch = float(rates.get("chaos") or 0.0)
+    if not n_ex:
+        return {}
+    lines = {l.get("id"): l for l in (payload.get("lines") or [])}
+    now = time.time()
+    out: dict[str, list[list[float]]] = {}
+    for cid in ids:
+        line = lines.get(cid)
+        if not line:
+            continue
+        spark = line.get("sparkline") or {}
+        data = spark.get("data") or []
+        pv = float(line.get("primaryValue") or 0.0)
+        if not pv or not data:
+            continue
+        total = float(spark.get("totalChange") or 0.0)
+        start = pv / (1 + total / 100.0) if total > -100 else pv
+        n = len(data)
+        pts: list[list[float]] = []
+        for i, d in enumerate(data):
+            ts = int(now - (n - 1 - i) * 86400)
+            if ts < cutoff:
+                continue
+            try:
+                v = start * (1 + float(d) / 100.0)
+            except (TypeError, ValueError):
+                continue
+            if base == "exalted":
+                v *= n_ex
+            elif base == "chaos":
+                if not n_ch:
+                    continue
+                v *= n_ch
+            # base == divine：v 本身（primaryValue 就是神圣石计价）
+            pts.append([ts, float(v)])
+        if pts:
+            out[cid] = _spark_thin(pts)
+    return out
+
+
+def spark_payload(ids: list[str], base: str, hours: int, src: str,
+                  source: str = "") -> dict:
+    """一批通货的缩略曲线。
+
+    参数与 /api/history 同源（base / hours / src / source），这样列表里的
+    小图和点开看到的大图必然是同一条曲线——切源时两边一起变。
+
+    ⚠️ 返回平铺数组 [ts, v, ts, v, …] 而不是 [[ts, v], …]：
+       一屏几十上百行时，省掉每点一对中括号能少传近一半字节。
+    """
+    ids = [str(x).strip() for x in ids if str(x).strip()][:SPARK_MAX_IDS]
+    column = BASE_COLUMNS.get(base) or "value_exalted"
+    cutoff = int(time.time()) - hours * 3600
+    src = str(src or "db").strip().lower()
+    if not ids:
+        series: dict[str, list[list[float]]] = {}
+    elif src == "scout":
+        # 外源可能临时不通：小图拉不到不该让整张榜单报错，退化成空（前端画虚线）
+        try:
+            series = _spark_from_scout(ids, base, cutoff)
+        except Exception as exc:                                   # noqa: BLE001
+            log(f"  · 取 poe2scout 缩略曲线失败（{exc}），本轮不画小图")
+            series = {}
+    elif src == "ninja":
+        try:
+            series = _spark_from_ninja(ids, base, cutoff)
+        except Exception as exc:                                   # noqa:BLE001
+            log(f"  · 取 poe.ninja 缩略曲线失败（{exc}），本轮不画小图")
+            series = {}
+    else:
+        series = _spark_from_db(ids, column, cutoff,
+                                price_source_key(source) or "")
+    return {
+        "base": base,
+        "hours": hours,
+        "src": src,
+        "source": source or "",
+        "points_max": SPARK_MAX_POINTS,
+        "sparks": {
+            cid: [float(x) for pt in pts for x in pt]
+            for cid, pts in series.items()
+        },
+    }
+
+
 def query_history(currency_id: str, hours: int, src: str = "db",
                   source: str = "") -> dict:
     """返回某个通货在三种基准下的历史序列，供详情弹窗切换查看。
@@ -6802,6 +7003,21 @@ class Handler(BaseHTTPRequestHandler):
                     arbitrage_rows(
                         base, args.get("category", ["all"])[0],
                         args.get("q", [""])[0], hours,
+                        args.get("source", [""])[0],
+                    )
+                )
+            elif path == "/api/sparks":
+                # 倒货榜每行那个小曲线的批量接口（v1.28.3）。
+                # 参数与 /api/history 对齐，小图和大图才不会各说各话。
+                base = args.get("base", ["exalted"])[0]
+                if base not in BASE_COLUMNS:
+                    base = "exalted"
+                hours = _safe_int(args.get("hours", ["24"])[0], 24, 1, 24 * RETENTION_DAYS)
+                self._json(
+                    spark_payload(
+                        (args.get("ids", [""])[0] or "").split(","),
+                        base, hours,
+                        args.get("src", ["db"])[0],
                         args.get("source", [""])[0],
                     )
                 )
