@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.28.3"
+VERSION = "1.28.4"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -5162,35 +5162,35 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
 
 CALC_BASES = ("exalted", "chaos", "divine")
 
+# ★★ 别再尝试做「跨基准兑换贸易差」排行榜（v1.28.4 做过一次又删了）
+#
+# 想法是：同一个通货在崇高石 / 混沌石 / 神圣石三个基准下的报价未必自洽，
+# 用最便宜的基准买、最贵的基准卖就能白赚这一段。听起来很美，但数据不支持：
+#
+#   · 三个源（dadsofexile / poe2scout / poe.ninja）**每个通货都只给一个价**
+#     （doe 是 price_exalted，ninja 是 primaryValue，scout 是一个数）；
+#   · 库里 value_chaos / value_divine 两列是这**同一个价按汇率折算**出来的
+#     （见 by_source 的赋值：price / fd_div、price / fd_ex、price / fd_ch）；
+#   · 实测判据：同一轮内 divine/exalted 对所有通货**严格恒定**（342 行全是
+#     0.0015019923），这就是同源折算的铁证；
+#   · 于是「贸易差」算出来的是 **汇率跨轮次漂移的伪影**——因为取价是「每个通货
+#     各自取最近一行」，不同通货的行可能来自不同轮次，而汇率每轮都在变
+#     （实测 1 神圣 = 665.78 → 663.13 → 660.93 崇高石）。看着像 4%~13% 的空间，
+#     其实什么都不代表。
+#
+# 真实的三边报价只存在于**游戏内货币交易所**（多个货币对各自挂单，天然不一致），
+# PoE Overlay 就是直接读它。要拿到只能打官方 /api/trade2/exchange —— 本项目早试过
+# 并放弃了：挂单窗口极小、脏单多、限流极凶（见文件头注释与「买卖差价榜已移除」）。
+# 想算三基准贸易差，走计算器里那张**手工录入**的九条买卖路径表。
 
-def calc_payload() -> dict:
-    """换汇计算器所需的数据。
 
-    前端拿它做两件事：
-      1. 把用户手工录入的「目标通货 换 崇高石 / 混沌石 / 神圣石」报价折算到同一把尺子上；
-      2. 提供通货清单与聚合参考价，方便填表时对照。
+def calc_bases(rows: list) -> dict[str, float]:
+    """三种基准货币的「身价」：以崇高石为 1，混沌石 / 神圣石各值多少崇高石。
 
-    为什么不做自动抓挂单：官方 trade2 的挂单和游戏内交易所不是同一批数据
-    （详见 _废弃_悬浮窗方案/问题总结.md），自动抓出来的价和游戏里对不上，
-    所以这里只提供聚合汇率，买卖报价由用户按游戏内实际看到的手工录入。
+    它们自己也在快照里，直接取最准；快照里没有时用其它通货的三种报价反推中位数。
+    ⚠️ 计算器（手工录入折算）和贸易差排行（跨基准比价）必须用同一把尺子，
+       否则同一个通货在两处算出来的价差对不上，所以抽出来共用。
     """
-    row = db().execute(
-        "SELECT MAX(ts) AS ts FROM snapshot WHERE league = ?", (STATE["league"],)
-    ).fetchone()
-    if not row or row["ts"] is None:
-        return {"meta": build_meta("exalted", 0, 0), "bases": {}, "rates": {}, "items": []}
-
-    latest_ts = int(row["ts"])
-    rows = latest_snapshot_rows(
-        STATE["league"],
-        ["s.currency_id", "s.category", "s.value_divine", "s.value_chaos",
-         "s.value_exalted"],
-    )
-    meta_rows = {r["currency_id"]: r for r in db().execute("SELECT * FROM item_meta").fetchall()}
-    labels = dict(CATEGORIES)
-
-    # 三种基准货币的「身价」：以崇高石为 1，算出混沌石 / 神圣石各值多少崇高石。
-    # 它们自己也在快照里，直接取最准；快照里没有时用其它通货的三种报价反推中位数。
     by_id = {r["currency_id"]: r for r in rows}
     bases: dict[str, float] = {"exalted": 1.0}
     for cid in ("chaos", "divine"):
@@ -5212,6 +5212,42 @@ def calc_payload() -> dict:
         for cid, values in samples.items():
             if cid not in bases and values:
                 bases[cid] = sorted(values)[len(values) // 2]
+    return bases
+
+
+def calc_payload(source: str = "") -> dict:
+    """换汇计算器所需的数据。
+
+    前端拿它做两件事：
+      1. 把用户手工录入的「目标通货 换 崇高石 / 混沌石 / 神圣石」报价折算到同一把尺子上；
+      2. 提供通货清单与聚合参考价，方便填表时对照。
+
+    source 指定 doe / scout / ninja 时，聚合价取该源自己的那份（v1.28.4）——
+    顶部换了取价源，「用聚合价填入」和贸易差排行都得跟着换，不然两处对不上。
+
+    为什么不做自动抓挂单：官方 trade2 的挂单和游戏内交易所不是同一批数据
+    （详见 _废弃_悬浮窗方案/问题总结.md），自动抓出来的价和游戏里对不上，
+    所以这里只提供聚合汇率，买卖报价由用户按游戏内实际看到的手工录入。
+    """
+    row = db().execute(
+        "SELECT MAX(ts) AS ts FROM snapshot WHERE league = ?", (STATE["league"],)
+    ).fetchone()
+    if not row or row["ts"] is None:
+        return {"meta": build_meta("exalted", 0, 0), "bases": {}, "rates": {}, "items": []}
+
+    latest_ts = int(row["ts"])
+    rows = latest_snapshot_rows(
+        STATE["league"],
+        ["s.currency_id", "s.category", "s.value_divine", "s.value_chaos",
+         "s.value_exalted"],
+    )
+    srckey = price_source_key(source)
+    if srckey:
+        rows = merge_src_prices(rows, str(STATE["league"]), srckey)
+    meta_rows = {r["currency_id"]: r for r in db().execute("SELECT * FROM item_meta").fetchall()}
+    labels = dict(CATEGORIES)
+
+    bases = calc_bases(rows)
 
     # rates[a][b] = 1 个 a 值多少个 b
     rates = {
@@ -5260,9 +5296,8 @@ def calc_payload() -> dict:
         "rates": rates,
         "items": items,
         "base_icons": base_icons,
+        "srckey": srckey,
     }
-
-
 def _meta_value(key: str) -> int:
     row = db().execute("SELECT v FROM app_meta WHERE k = ?", (key,)).fetchone()
     return int(row["v"]) if row and row["v"] else 0
@@ -6955,7 +6990,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(spread_rows(ref, hours, args.get("q", [""])[0]))
             elif path == "/api/calc":
                 # 换汇计算器：只给聚合汇率与通货清单，买卖报价由用户在页面上手工录入
-                self._json(calc_payload())
+                # source：换取价源后，聚合参考价也要跟着换成该源的口径
+                self._json(calc_payload(args.get("source", [""])[0]))
             elif path == "/api/history":
                 hours = _safe_int(args.get("hours", ["72"])[0], 72, 1, 24 * RETENTION_DAYS)
                 self._json(query_history(
