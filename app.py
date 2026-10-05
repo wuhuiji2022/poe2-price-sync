@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.28.4"
+VERSION = "1.29.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -353,6 +353,29 @@ CREATE TABLE IF NOT EXISTS snapshot_src (
 );
 CREATE INDEX IF NOT EXISTS idx_snapshot_src_lookup
     ON snapshot_src (league, source, currency_id, ts DESC);
+-- poe2scout 小时级历史的**本地累积**（v1.29.0）。
+--
+-- 为什么需要它：详情曲线里「poe2scout」那一栏原先是直连源站现拉的，而
+-- /Leagues/{league}/Items/PriceHistory 这个端点**只返回最近 24 小时**
+-- （实测 829 个物品 × 24 条小时级记录）——hours 参数设到 72 也照样只给 24 个点。
+-- 内存缓存 TTL 调多久都没用，负载里就只有那 24 个小时。
+-- 本机是长在线的，所以每次刷新批量历史时顺手把它落盘累积起来，
+-- 攒满之后这条曲线就能回溯到跟本机记录一样的窗口（retention_days，默认 3 天）。
+--
+-- ⚠️ 只存 exalted 计价：那是 scout 的原生单位。chaos / divine 两列不是源站给的，
+--    是拿同一时间网格上 chaos、divine 自己的 exalted 价换算出来的
+--    （它们本身也在这 829 个物品里，同样存在这张表中），多存两列纯属冗余。
+CREATE TABLE IF NOT EXISTS scout_hist (
+    league        TEXT    NOT NULL,
+    currency_id   TEXT    NOT NULL,
+    ts            INTEGER NOT NULL,
+    value_exalted REAL,
+    PRIMARY KEY (league, currency_id, ts)
+);
+-- 主键本身已经覆盖了 (league, currency_id, ts) 的读取，
+-- 这一条只为按时间清理过期数据时不必全表扫。
+CREATE INDEX IF NOT EXISTS idx_scout_hist_ts
+    ON scout_hist (league, ts);
 CREATE TABLE IF NOT EXISTS spread (
     ts           INTEGER NOT NULL,
     league       TEXT    NOT NULL,
@@ -3360,6 +3383,9 @@ def prune_snapshot(league: str) -> None:
         connection.execute("DELETE FROM snapshot WHERE ts < ?", (cutoff,))
         # 分源那份跟着同一个保留期一起清，否则它会悄悄攒成库里的第二大表
         connection.execute("DELETE FROM snapshot_src WHERE ts < ?", (cutoff,))
+        # poe2scout 小时级历史同样跟着走：它存在的意义就是「跟本机记录一样长」，
+        # 留得比本机记录久毫无用处（源站端点自己只给 24 小时，超出的全靠攒）。
+        connection.execute("DELETE FROM scout_hist WHERE ts < ?", (cutoff,))
         connection.execute(
             "UPDATE snapshot SET spark = NULL"
             " WHERE spark IS NOT NULL"
@@ -4207,6 +4233,112 @@ SCOUT_HIST_TTL_SECONDS = _clamp_int(
 )
 _SCOUT_HIST_CACHE: dict[str, tuple[float, dict]] = {}
 
+# ★ 落盘累积（v1.29.0）：源站那个端点只给 24 小时，靠一路攒才能回溯三天。
+SCOUT_HIST_STORE = bool(CONFIG.get("scout_history_store", True))
+# 每次刷新时，除了新点，还要把「最近这么久之内」的点一并重写。
+# 为什么：scout 的小时桶在整点之前会持续被修订，只写新点的话，
+# 最后一格会永久冻在它刚出现时的半成品值上。
+SCOUT_HIST_REWRITE_SECONDS = _clamp_int(
+    CONFIG.get("scout_history_rewrite_seconds", 2 * 3600), 2 * 3600, 600, 24 * 3600
+)
+# ★★ 按「联盟 → 通货」各自记一个已存到的最新时间点，不是整个联盟共用一个。
+#
+# 为什么不能共用一个：源站那个端点给每个物品**固定 24 个点**，但冷门物品的
+# 这 24 个点会被摊到好几天上（实测跨度中位 23h、尾部最长 480h，相邻点间隔
+# 几小时到十几小时）。若拿全联盟那个最大值当门槛，冷门物品那些晚发布的老点
+# 会因为「早于门槛 2 小时」被整片丢掉，攒三天也只攒下它偶尔更新的一两个点。
+_SCOUT_HIST_STORED: dict[str, dict[str, int]] = {}
+
+
+def _scout_hist_store(league: str, data: dict[str, dict[int, float]]) -> int:
+    """把批量历史里的点写进 scout_hist（已存在的点用 REPLACE 覆盖）。
+
+    ⚠️ 每个通货只写「比它自己已存最新的点还新」的，外加最近
+      SCOUT_HIST_REWRITE_SECONDS 内的。每轮全量重写是上万个 REPLACE，
+      白白把 WAL 撑大；而最近那一两个小时又必须重写，
+      否则最后一格会冻在它刚出现时的半成品值上。
+    """
+    if not league or not data:
+        return 0
+    floors = _SCOUT_HIST_STORED.get(league)
+    if floors is None:
+        floors = {
+            r["currency_id"]: int(r["m"] or 0)
+            for r in db().execute(
+                "SELECT currency_id, MAX(ts) AS m FROM scout_hist"
+                " WHERE league = ? GROUP BY currency_id", (league,)
+            ).fetchall()
+        }
+        _SCOUT_HIST_STORED[league] = floors
+    records: list[tuple[str, str, int, float]] = []
+    for cid, series in data.items():
+        if not series:
+            continue
+        keep_from = max(0, floors.get(cid, 0) - SCOUT_HIST_REWRITE_SECONDS)
+        for ts, value in series.items():
+            if ts >= keep_from and value > 0:
+                records.append((league, cid, int(ts), float(value)))
+        top = max(series)
+        if top > floors.get(cid, 0):
+            floors[cid] = int(top)
+    if not records:
+        return 0
+    with db() as connection:
+        connection.executemany(
+            "INSERT OR REPLACE INTO scout_hist"
+            " (league, currency_id, ts, value_exalted) VALUES (?, ?, ?, ?)",
+            records,
+        )
+    return len(records)
+
+
+def _scout_hist_local(league: str, currency_id: str, cutoff: float) -> dict[int, float]:
+    """读出本机攒下来的 scout 小时级历史：{时间点: exalted 计价的价格}。"""
+    if not league or not currency_id:
+        return {}
+    try:
+        rows = db().execute(
+            "SELECT ts, value_exalted AS v FROM scout_hist"
+            " WHERE league = ? AND currency_id = ? AND ts >= ? ORDER BY ts ASC",
+            (league, currency_id, int(cutoff)),
+        ).fetchall()
+    except Exception:                                           # noqa: BLE001
+        return {}
+    out: dict[int, float] = {}
+    for row in rows:
+        v = row["v"]
+        if v is None or v != v:                                 # 过滤 NULL / NaN
+            continue
+        out[int(row["ts"])] = float(v)
+    return out
+
+
+def _merge_scout_remote(league: str, currency_id: str,
+                        bucket: dict[int, float], cutoff: float) -> None:
+    """把源站现拉的那份并进 bucket（重合的点以源站为准，它更新）。
+
+    批量端点一次就能拿到全部物品；它挂了才退回逐个问（6 小时粒度、36 小时）。
+    ⚠️ 本机那份已经够全时就别再为「逐个问」打几百个请求。
+    """
+    bulk = _scout_bulk_history(league)
+    remote = bulk.get(currency_id) if bulk else None
+    if remote is None and len(bucket) < LOCAL_POINTS_MIN:
+        remote = _scout_price_logs(league, currency_id)
+    for ts, value in (remote or {}).items():
+        if ts >= cutoff:
+            bucket[ts] = value
+
+
+def _scout_hist_merged(league: str, currency_id: str, cutoff: float) -> dict[int, float]:
+    """scout 口径的完整历史：本机累积的那份 + 源站现拉的那份。
+
+    大图（_history_from_scout）和小图（_spark_from_scout）都走它，
+    两边必然是同一条曲线、同一个长度。
+    """
+    hist = _scout_hist_local(league, currency_id, cutoff)
+    _merge_scout_remote(league, currency_id, hist, cutoff)
+    return hist
+
 
 def _scout_bulk_history(league: str, *, force: bool = False) -> dict[str, dict[int, float]]:
     """一次拿全部物品的小时级历史，返回 {api_id: {时间点: 以崇高石计价的价格}}。
@@ -4270,6 +4402,13 @@ def _scout_bulk_history(league: str, *, force: bool = False) -> dict[str, dict[i
     if out:
         with _SCOUT_LOCK:
             _SCOUT_HIST_CACHE[league] = (time.time(), out)
+        # ★ 落盘累积（v1.29.0）：只在真的拉到了新数据时写，缓存命中不重复写。
+        #   写失败不影响本轮曲线（内存里这份还在），所以只记日志。
+        if SCOUT_HIST_STORE:
+            try:
+                _scout_hist_store(league, out)
+            except Exception as exc:                            # noqa: BLE001
+                log(f"  · scout 历史落盘失败（不影响使用）：{exc}")
     return out
 
 
@@ -5379,24 +5518,38 @@ def build_meta(base: str, latest_ts: int, count: int) -> dict:
 
 
 def _history_from_scout(currency_id: str, hours: int, meta) -> dict:
-    """直接向 poe2scout 要这个通货的历史（小时级，最近 24 小时）。
+    """poe2scout 口径的历史（小时级）。
 
-    批量端点一次就能拿到全部物品；它挂了才退回逐个问（6 小时粒度、36 小时）。
-    批量那份带 20 分钟缓存（它给的数据本来就是小时级的），所以正常路径不走网络。
-    价格是 exalted 计价，divine/chaos 用同一时间网格上基准货币的价换算。
+    ★ v1.29.0：两份数据合起来用，不再只靠现拉。
+      · **本机累积的那份**（scout_hist 表）——源站端点只给最近 24 小时，
+        但本机是长在线的，每次刷新批量历史都把新点落盘，攒满之后这条曲线
+        就能回溯到跟本机记录一样的窗口（retention_days，默认 3 天）。
+        它是这条曲线的主力。
+      · **源站现拉的那份**——只有 24 小时，用来补本机还没攒到的
+        （刚装上、或当前小时那一格还没落盘）。
+
+    两边的时间戳在同一个小时网格上，重合的点以源站为准（它更新）。
+    价格仍是 exalted 计价，divine/chaos 用同一时间网格上基准货币的价换算。
     """
     league = str(STATE.get("league") or "")
     cutoff = time.time() - hours * 3600
+    hist = _scout_hist_local(league, currency_id, cutoff)
+    had_local = bool(hist)
+    _merge_scout_remote(league, currency_id, hist, cutoff)
+    div = _scout_hist_merged(league, "divine", cutoff)
+    ch = _scout_hist_merged(league, "chaos", cutoff)
+    # 源站那份有没有（决定了下面的粒度文案）
     bulk = _scout_bulk_history(league)
-    hist = (bulk.get(currency_id) if bulk else None) or _scout_price_logs(league, currency_id)
-    div = (bulk.get("divine") if bulk else None) or _scout_price_logs(league, "divine")
-    ch = (bulk.get("chaos") if bulk else None) or _scout_price_logs(league, "chaos")
-    gran = "小时级" if bulk else "6 小时级（批量端点不可用）"
+
+    if had_local:
+        gran = "小时级 · 本机缓存"
+    elif bulk:
+        gran = "小时级（源站只给 24 小时）"
+    else:
+        gran = "6 小时级（批量端点不可用）"
 
     ex_pts, ch_pts, dv_pts = [], [], []
     for ts in sorted(hist):
-        if ts < cutoff:
-            continue
         ex = hist[ts]
         ex_pts.append([ts, ex])
         if ch.get(ts):
@@ -5537,20 +5690,20 @@ def _spark_from_db(ids: list[str], column: str, cutoff: int,
 
 def _spark_from_scout(ids: list[str], base: str,
                       cutoff: int) -> dict[str, list[list[float]]]:
-    """poe2scout：批量端点一次拿全市场（带 20 分钟缓存），这里只做切片。
+    """poe2scout：本机累积的那份为主，源站现拉的那份补最新（v1.29.0）。
 
-    换算跟 _history_from_scout 一致：批量那份是 exalted 计价，
+    换算跟 _history_from_scout 一致：都是 exalted 计价，
     混沌 / 神圣用同一时间网格上基准货币的价折出来。
+    ★ 两边都走 _scout_hist_merged，所以列表里的小图和点开的大图
+      必然是同一条曲线、同一个长度（原来小图只有源站的 24 小时）。
     """
     league = str(STATE.get("league") or "")
-    bulk = _scout_bulk_history(league)
-    if not bulk:
-        return {}
-    div = bulk.get("divine") or {}
-    ch = bulk.get("chaos") or {}
+    # 只有要折成混沌 / 神圣时才需要基准货币那条序列
+    div = _scout_hist_merged(league, "divine", cutoff) if base == "divine" else {}
+    ch = _scout_hist_merged(league, "chaos", cutoff) if base == "chaos" else {}
     out: dict[str, list[list[float]]] = {}
     for cid in ids:
-        hist = bulk.get(cid)
+        hist = _scout_hist_merged(league, cid, cutoff)
         if not hist:
             continue
         pts: list[list[float]] = []
