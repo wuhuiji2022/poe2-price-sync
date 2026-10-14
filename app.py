@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.29.0"
+VERSION = "1.29.2"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -75,27 +75,31 @@ DEFAULT_CONFIG: dict = {
     "interval_minutes": 30,   # 数据源约每 30~70 分钟成批刷新一次，30 分钟抓一次能把滞后压到最小
     "port": 8712,
     "retention_days": 30,
-    # 分类顺序照抄 PoE Overlay II（market-history 侧栏）：
-    # currency → essences → delirium → breach → abyss → fragments → runes →
-    # ritual → soul-cores → idols → uncut-gems → expedition → gems。
-    # 实测对照（2026-09-24）：Overlay 那 14 档里 12 档在 poe.ninja 上有数据；
-    #   · atziri's-temple、gems 两档 ninja 不提供 —— gems 用 LineageSupportGems 顶上
-    #   · 我们多一档 Verisium（赛季内容，Overlay 没单列），排在最后
-    # 注意 id 必须是官方静态数据的分组名（会被拿去打 ninja），不能写中文或 Overlay 的 slug。
+    # ★ 分类顺序与名称都以 PoE Overlay II 的 market-history 侧栏为准（2026-10-10 截图核对）：
+    #   通貨 → 精髄 → 譫妄異域 → 裂痕聯盟 → 深渊 → 阿茲里的神殿 → 碎片 → 符文
+    #   → 祭杞 → 靈魂核心 → 魔偶 → 未切割的寶石 → 死境探險 → 寶石
+    # ⚠️ 只有「名称与顺序」跟 Overlay 一致，**id 不能照抄它的 slug**：
+    #   实测把 soul-cores / uncut-gems 那套 slug 全打 poe.ninja，14 档**全部返回 0 条**
+    #   （slug 是 Overlay 自己的内部 key）。id 必须是官方静态数据的分组名，
+    #   否则那一档永远抓不到价。
+    # 两处对不齐，已按实测取舍：
+    #   · 阿茲里的神殿（atziri's-temple）：本联盟官方静态数据里没有，ninja 也是 0 条 → 不纳入
+    #   · 寶石：官方对应 LineageSupportGems（本联盟唯一有宝石报价的分组，76/75 条）
+    #   · Verisium 是赛季内容、Overlay 还没这一档，我们保留并排在最后（用户决定）
     "categories": [
-        {"id": "Currency", "label": "通货", "enabled": True},
-        {"id": "Essences", "label": "精髓", "enabled": True},
-        {"id": "Delirium", "label": "液态情感", "enabled": True},
-        {"id": "Breach", "label": "裂隙催化剂", "enabled": True},
-        {"id": "Abyss", "label": "深渊之骨", "enabled": True},
+        {"id": "Currency", "label": "通貨", "enabled": True},
+        {"id": "Essences", "label": "精髄", "enabled": True},
+        {"id": "Delirium", "label": "譫妄異域", "enabled": True},
+        {"id": "Breach", "label": "裂痕聯盟", "enabled": True},
+        {"id": "Abyss", "label": "深渊", "enabled": True},
         {"id": "Fragments", "label": "碎片", "enabled": True},
         {"id": "Runes", "label": "符文", "enabled": True},
-        {"id": "Ritual", "label": "祭坛预兆", "enabled": True},
-        {"id": "SoulCores", "label": "灵魂核心", "enabled": True},
-        {"id": "Idols", "label": "神像", "enabled": True},
-        {"id": "UncutGems", "label": "未切割宝石", "enabled": True},
-        {"id": "Expedition", "label": "远征物品", "enabled": True},
-        {"id": "LineageSupportGems", "label": "血统辅助宝石", "enabled": True},
+        {"id": "Ritual", "label": "祭杞", "enabled": True},
+        {"id": "SoulCores", "label": "靈魂核心", "enabled": True},
+        {"id": "Idols", "label": "魔偶", "enabled": True},
+        {"id": "UncutGems", "label": "未切割的寶石", "enabled": True},
+        {"id": "Expedition", "label": "死境探險", "enabled": True},
+        {"id": "LineageSupportGems", "label": "寶石", "enabled": True},
         {"id": "Verisium", "label": "维里斯汞金", "enabled": True},
     ],
     "auto_discover_categories": True,  # 每次同步时探测官方新增的类别
@@ -395,7 +399,12 @@ CREATE TABLE IF NOT EXISTS item_meta (
     currency_id TEXT PRIMARY KEY,
     name_en     TEXT,
     name_zh     TEXT,
-    icon        TEXT
+    icon        TEXT,
+    -- ★ 中文效果说明（v1.29.2）：来自 poe2db 繁體站的逐项页，
+    --   三个行情源都不给这个字段（官方静态数据只有 id/text/image，
+    --   poe2scout 的 Text 就是名字），所以只能外部补。
+    --   同步脚本 _sync_desc.py 写入，约 780 条、十万字量级。
+    desc        TEXT
 );
 -- 暗金物品快照。同一件暗金会按 roll 档位拆成多行，
 -- 所以主键是 (档位 key) 而不是物品名，归组展示时再按 name + base_type 合在一起。
@@ -437,6 +446,32 @@ CREATE TABLE IF NOT EXISTS unique_market (
     PRIMARY KEY (league, name, variant)
 );
 CREATE TABLE IF NOT EXISTS app_meta (k TEXT PRIMARY KEY, v TEXT);
+-- ★★ 日内节律专用表（v1.29.1，2026-10-10 用户提出「有的通货早上便宜晚上贵」）。
+--
+-- 为什么不用 snapshot 就地分析：
+--   snapshot 跟着 RETENTION_DAYS（当前 3 天）一起清。想看一周的节律就物理上做不到，
+--   而 3 天刚好卡在「跨不了一个完整周」，时段效应和周内效应永远分不开。
+--   （v1.29.1 之前实测 3 天数据：最便宜 10:00 −12.28% / 最贵 16:00 −3.62%，
+--     看着像节律，但 3 天同时混着周内差异，无法判定。）
+--
+-- 这张表存「每通货每小时的价」，粒度粗、体积小，所以能留 60 天（约 95 万行 ≈ 40MB）：
+--   · 不受 retention_days 影响 —— 榜单口径不变（仍是 3 天），只是多一份长周期底账
+--   · 每轮抓取后顺带写，不额外发任何网络请求
+--   · 用途：时段节律分析（全市场几点便宜/贵）+ 给每个通货算「建议买入/卖出时段」
+CREATE TABLE IF NOT EXISTS intraday (
+    league        TEXT    NOT NULL,
+    currency_id   TEXT    NOT NULL,
+    hour_ts       INTEGER NOT NULL,   -- 该小时整点（UTC 秒，对齐到 3600）
+    value_exalted REAL,
+    value_divine  REAL,
+    value_chaos   REAL,
+    volume        REAL,
+    n_samples     INTEGER DEFAULT 1,  -- 这一小时内记了几次（源 30 分钟一变，约 2 次）
+    source        TEXT DEFAULT 'local',
+    PRIMARY KEY (league, currency_id, hour_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_intraday_hour
+    ON intraday (league, hour_ts);
 """
 
 
@@ -512,6 +547,13 @@ def _clamp_float(raw, fallback: float, low: float, high: float) -> float:
         return max(low, min(high, float(raw)))
     except (TypeError, ValueError):
         return fallback
+
+
+# 日内节律表单独留多久（跟榜单的 retention_days 无关）。
+# 60 天 ≈ 8 个完整周 —— 少于这个数就分不开「时段效应」和「周内效应」。
+INTRADAY_RETENTION_DAYS = _clamp_int(
+    CONFIG.get("intraday_retention_days", 60), 60, 14, 365
+)
 
 
 # 通货报价用哪个源。scout = poe2scout（更贴近游戏内交易所），ninja = poe.ninja。
@@ -2552,7 +2594,8 @@ def spread_rows(ref: str, hours: int, query: str) -> dict:
         meta = meta_rows.get(cid)
         name_en = meta["name_en"] if meta and meta["name_en"] else cid
         name_zh = zh_display_name(cid, meta)
-        if not matches_query(query, cid, name_en, name_zh):
+        if not matches_query(query, cid, name_en, name_zh,
+                             meta["desc"] if meta else ""):
             continue
         if not name_zh:
             no_zh += 1
@@ -3372,6 +3415,54 @@ def backfill_history(league: str, ts: int) -> int:
     return len(records)
 
 
+def record_intraday(league: str, rows: list[tuple]) -> int:
+    """把这一轮的价格记进 intraday 表（每通货每小时一行）。
+
+    ★ 为什么不复用 snapshot：snapshot 跟 RETENTION_DAYS 一起清（当前 3 天），
+      而看节律需要跨 8 个完整周 —— 3 天物理上做不到。
+    ★ 为什么用整点做主键：源站约 30 分钟才变一次，一个小时内会记到好几次，
+      全部 REPLACE 到同一行，n_samples 累加。这样每个 (通货, 小时) 只有一行，
+      天然抹平了采样抖动，分析时不用再做去自相关。
+    rows 每项： (currency_id, value_exalted, value_divine, value_chaos, volume)
+    """
+    if not rows:
+        return 0
+    hour_ts = int(time.time()) // 3600 * 3600
+    out = []
+    for cid, ex, dv, ch, vol in rows:
+        try:
+            exv = float(ex)
+        except (TypeError, ValueError):
+            continue
+        if exv <= 0:
+            continue
+        try:
+            dvv = float(dv) if dv is not None else None
+        except (TypeError, ValueError):
+            dvv = None
+        try:
+            chv = float(ch) if ch is not None else None
+        except (TypeError, ValueError):
+            chv = None
+        try:
+            volv = float(vol) if vol is not None else None
+        except (TypeError, ValueError):
+            volv = None
+        out.append((league, str(cid), hour_ts, exv, dvv, chv, volv))
+    if not out:
+        return 0
+    with db() as connection:
+        connection.executemany(
+            "INSERT OR REPLACE INTO intraday"
+            " (league, currency_id, hour_ts, value_exalted, value_divine,"
+            "  value_chaos, volume, n_samples)"
+            " VALUES (?,?,?,?,?,?,?, COALESCE((SELECT n_samples FROM intraday"
+            "  WHERE league=? AND currency_id=? AND hour_ts=?), 0) + 1)",
+            [(*r, r[0], r[1], r[2]) for r in out],
+        )
+    return len(out)
+
+
 def prune_snapshot(league: str) -> None:
     """清理过期数据，并把历史快照里的 spark 字段清空。
 
@@ -3386,6 +3477,10 @@ def prune_snapshot(league: str) -> None:
         # poe2scout 小时级历史同样跟着走：它存在的意义就是「跟本机记录一样长」，
         # 留得比本机记录久毫无用处（源站端点自己只给 24 小时，超出的全靠攒）。
         connection.execute("DELETE FROM scout_hist WHERE ts < ?", (cutoff,))
+        # 日内节律表**不走 RETENTION_DAYS**：它的存在意义就是比榜单看得长
+        # （榜单 3 天，节律要跨 8 个完整周才能把「时段」和「周内」分开）。
+        connection.execute("DELETE FROM intraday WHERE hour_ts < ?",
+                           (int(time.time()) - INTRADAY_RETENTION_DAYS * 86400,))
         connection.execute(
             "UPDATE snapshot SET spark = NULL"
             " WHERE spark IS NOT NULL"
@@ -3965,6 +4060,21 @@ def take_snapshot(league: str) -> tuple[int, int]:
     backfilled = backfill_history(league, ts)
     if backfilled:
         log(f"  ✓ 由 7 天趋势回填了 {backfilled} 条历史价格")
+    # 日内节律底账：每轮顺带写一小时，不额外发请求（v1.29.1）
+    try:
+        with db() as _c:
+            _intra = [
+                (r["currency_id"], r["value_exalted"], r["value_divine"],
+                 r["value_chaos"], r["volume"])
+                for r in _c.execute(
+                    "SELECT currency_id, value_exalted, value_divine,"
+                    " value_chaos, volume FROM snapshot"
+                    " WHERE league=? AND ts=? AND value_exalted > 0", (league, ts))
+            ]
+        if _intra:
+            record_intraday(league, _intra)
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · 日内节律记录失败（不影响抓取）：{exc}")
 
     # 回填也要走完再清理，否则刚回填进来的历史行会带着 spark 留到下一轮
     prune_snapshot(league)
@@ -4752,6 +4862,11 @@ def init_db() -> None:
             connection.execute("ALTER TABLE snapshot ADD COLUMN stock REAL")
         if "orders" not in columns:
             connection.execute("ALTER TABLE snapshot ADD COLUMN orders INTEGER")
+        # ★ v1.29.2：旧库的 item_meta 没有 desc 列（见 SCHEMA 里的注释）
+        meta_columns = {row["name"] for row in
+                        connection.execute("PRAGMA table_info(item_meta)")}
+        if "desc" not in meta_columns:
+            connection.execute("ALTER TABLE item_meta ADD COLUMN desc TEXT")
 
 
 # ------------------------------------------------------------------ 后台调度
@@ -5228,10 +5343,10 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
         meta = meta_rows.get(cid)
         name_en = meta["name_en"] if meta and meta["name_en"] else cid
         name_zh = zh_display_name(cid, meta)
-        icon = meta["icon"] if meta and meta["icon"] else ""
-
-        if not matches_query(query, cid, name_en, name_zh):
+        if not matches_query(query, cid, name_en, name_zh,
+                              meta["desc"] if meta else ""):
             continue
+        icon = meta["icon"] if meta and meta["icon"] else ""
         if not name_zh:
             no_zh += 1
             continue
@@ -5283,6 +5398,9 @@ def rows_to_items(base: str, category: str, query: str, hours: int,
                 "category_label": labels.get(row["category"], row["category"]),
                 "name": name_en,
                 "name_zh": name_zh,
+                # ★ 通货说明（v1.29.2）：来自 poe2db 的中文效果描述，
+                #   详情弹窗显示、搜索框也能搜。没有就是空串（前端显示「暂无说明」）。
+                "desc": (meta["desc"] if meta and meta["desc"] else ""),
                 "icon": f"/icon?id={urllib.parse.quote(cid)}" if icon else "",
                 "value": value,
                 "values": values,
@@ -5418,6 +5536,7 @@ def calc_payload(source: str = "") -> dict:
                 "id": cid,
                 "name": (meta["name_en"] if meta and meta["name_en"] else cid),
                 "name_zh": name_zh,
+                "desc": (meta["desc"] if meta and meta["desc"] else ""),
                 "category": entry["category"],
                 "category_label": labels.get(entry["category"], entry["category"]),
                 "icon": icon_url(cid),
@@ -6832,7 +6951,8 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int,
         name_en = meta["name_en"] if meta and meta["name_en"] else cid
         name_zh = zh_display_name(cid, meta)
         icon = meta["icon"] if meta and meta["icon"] else ""
-        if not matches_query(query, cid, name_en, name_zh):
+        if not matches_query(query, cid, name_en, name_zh,
+                             meta["desc"] if meta else ""):
             continue
         if not name_zh:
             no_zh += 1
@@ -6881,6 +7001,7 @@ def arbitrage_rows(base: str, category: str, query: str, hours: int,
                 "category_label": labels.get(row["category"], row["category"]),
                 "name": name_en,
                 "name_zh": name_zh,
+                "desc": (meta["desc"] if meta and meta["desc"] else ""),
                 "icon": f"/icon?id={urllib.parse.quote(cid)}" if icon else "",
                 "value": current,
                 "values": values,
