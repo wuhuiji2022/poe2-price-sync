@@ -272,6 +272,24 @@ def main() -> int:
     print(f"  ✓ 写入 {written} 条（分源价另 {src_written} 条），裁掉 {dropped} 个过期时间点")
     print(f"  ✓ {DATA_FILE.name} {size_mb:.2f} MB  "
           f"时间轴 {len(data['ts'])} 点 / 通货 {len(data['items'])} 个")
+
+    # ── 小时数据（给日内节律分析用）────────────────────────────────
+    # 为什么顺带产出：节律要求 24 小时连续覆盖，而本机只在程序开着时记录，
+    # 实测 8 天里 3 天空档 → 报告算出的「最便宜时段」其实是采样最密的时段。
+    # 云端 24 小时都在跑，是唯一能填满的办法；而且复用同一批 rows，
+    # 不额外发任何请求、不额外烧额度。
+    try:
+        import cloud_hourly
+        info = cloud_hourly.write_hourly(
+            cloud_hourly.load_existing(), rows, ts, LEAGUE)
+        hb = cloud_hourly.HOUR_FILE.stat().st_size / 1024
+        print(f"  ✓ {cloud_hourly.HOUR_FILE.name} {hb:.0f} KB  "
+              f"小时轴 {info['hours']} 点 / 通货 {info['items']} 个"
+              f"（本轮并入 {info['written']} 条，裁掉 {info['dropped']} 个旧小时）")
+    except Exception as exc:                                    # noqa: BLE001
+        # 小时数据只是补数据，失败绝不能连带毁掉主数据.json
+        print(f"  · 小时数据写入失败（不影响主数据）：{exc}")
+
     return 0
 
 
