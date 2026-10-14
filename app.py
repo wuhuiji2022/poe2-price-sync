@@ -44,7 +44,7 @@ import zhdict
 from zhdict import ZH
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.29.2"
+VERSION = "1.30.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -2715,9 +2715,18 @@ def load_item_catalog() -> int:
         }
 
     with db() as connection:
+        # ★★ 绝不能用 INSERT OR REPLACE 写 item_meta（v1.29.4 实测踩到）：
+        #   OR REPLACE 是**整行替换**，而下面只列了4 个列 → 每次点「⚙ 更新」同步
+        #   物品库，desc（中文说明）就被整列清成 NULL。实测 484 条说明全没了，
+        #   列还在、数据全空 —— 和 v1.27.14「写侧少存一列= 读侧被顶掉」同一类事故。
+        #   正确写法：UPSERT 只更新自己管的那几列，desc 原样保留。
         connection.executemany(
-            "INSERT OR REPLACE INTO item_meta (currency_id, name_en, name_zh, icon)"
-            " VALUES (?, ?, ?, ?)",
+            "INSERT INTO item_meta (currency_id, name_en, name_zh, icon)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(currency_id) DO UPDATE SET"
+            "   name_en = excluded.name_en,"
+            "   name_zh = excluded.name_zh,"
+            "   icon    = excluded.icon",
             [
                 (cid, rec["name_en"], rec["name_zh"], rec["icon"])
                 for cid, rec in catalog.items()
