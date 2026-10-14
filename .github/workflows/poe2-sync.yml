@@ -51,6 +51,25 @@ jobs:
             fi
           fi
 
+      # ★★ 和上面同理，hourly.json 也必须先取回上一轮 ★★
+      # 少了这一步，cloud_hourly 每轮都读到空，小时轴永远只有 1 个点，
+      # 日内节律分析照样拿不到连续数据（跟 2026-09-28 data.json 那个事故同一类）。
+      - name: 取回上一轮的 hourly.json（小时节律数据）
+        run: |
+          if git show FETCH_HEAD:hourly.json > _prevh.json 2>/dev/null && [ -s _prevh.json ]; then
+            mv _prevh.json hourly.json
+            echo "已取回上一轮小时数据：$(( $(wc -c < hourly.json) / 1024 )) KB"
+          else
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/data/hourly.json" -o _prevh.json 2>/dev/null || true
+            if [ -s _prevh.json ]; then
+              mv _prevh.json hourly.json
+              echo "已取回上一轮小时数据（直连）：$(( $(wc -c < hourly.json) / 1024 )) KB"
+            else
+              rm -f _prevh.json
+              echo "首次运行，小时数据从空开始（要攒够 14 天才够分析）"
+            fi
+          fi
+
       # ⚠️ 没有 setup-python、也没有 pip install，都不是漏了：
       #   1. ubuntu-latest 镜像自带 Python 3.12，直接用 python3 即可；setup-python
       #      那一步要花 15~20 秒，20 分钟一轮的话一个月白白烧掉 1000+ 分钟额度。
@@ -78,6 +97,10 @@ jobs:
           git checkout --orphan data
           git rm -rf --cached . >/dev/null 2>&1 || true
           git add -f data.json
+          # hourly.json 是给日内节律分析的第二份文件（每通货每小时的价）。
+          # 没有它就 -f 一个空文件占位，让上面的「取回上一轮」不会因为文件不存在而走错分支。
+          if [ ! -f hourly.json ]; then echo '{}' > hourly.json; fi
+          git add -f hourly.json
           git commit -m "sync $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push -f origin data
 
@@ -86,5 +109,7 @@ jobs:
       # 永远是几小时前的 data.json，白白浪费这一轮抓取。
       - name: 刷新 jsDelivr 缓存
         run: |
-          curl -fsS "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/data.json" \
-            || echo "  · 缓存刷新失败（不影响数据本身，本机有直连源兜底）"
+          for f in data.json hourly.json; do
+            curl -fsS "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/$f" \
+              || echo "  · $f 缓存刷新失败（不影响数据本身，本机有直连源兜底）"
+          done
