@@ -42,9 +42,14 @@ from pathlib import Path
 
 import zhdict
 from zhdict import ZH
+# poeoverlay.com —— 第四个数据源（v1.31.0）。
+# 之所以单独成文件：它跟另外三个源的取数方式完全不同（解析 Next.js SSR 的
+# flight payload，而不是打 JSON API），逻辑不小，塞进 app.py 会让本来就
+# 9000 行的主文件更难读。纯标准库实现，不引入任何第三方依赖。
+import overlay as overlay_src
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.30.0"
+VERSION = "1.31.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -380,6 +385,38 @@ CREATE TABLE IF NOT EXISTS scout_hist (
 -- 这一条只为按时间清理过期数据时不必全表扫。
 CREATE INDEX IF NOT EXISTS idx_scout_hist_ts
     ON scout_hist (league, ts);
+-- poeoverlay 的多基准价（v1.31.0）。
+--
+-- 跟 snapshot 系列表的根本区别：**一列一个基准**，而不是把一个价折成三列。
+-- doe / scout / ninja 每个通货只给一个价，value_chaos / value_exalted /
+-- value_divine 都是拿这一个价除汇率尺子折出来的（同轮各通货比值恒定），
+-- 所以「跨基准差价」在它们身上是伪信号。Overlay 直接读游戏内 Currency Exchange
+-- 的多组挂单，chaos / exalted / divine 三个市场各自独立报价 —— 这是它能做
+-- 跨基准差价的唯一原因。
+--
+-- 一条请求同时给「现价 + 40 天日线」：series 的末点就是页面上的 Current price，
+-- 所以现价不用另开一张表，取每个 (通货, 基准) 的 MAX(ts) 那行即可。
+CREATE TABLE IF NOT EXISTS overlay_point (
+    league       TEXT    NOT NULL,
+    currency_id  TEXT    NOT NULL,
+    base         TEXT    NOT NULL,   -- divine / chaos / exalted / annul
+    ts           INTEGER NOT NULL,   -- 日线桶，UTC 毫秒
+    value        REAL,               -- 1 个该通货值多少基准货币
+    stock        REAL,               -- 挂出量
+    PRIMARY KEY (league, currency_id, base, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_overlay_point_ts
+    ON overlay_point (league, ts);
+-- Overlay 的目录（哪个分类下有哪些通货、URL slug 是什么）。
+-- 每轮刷新，用它决定下一轮要抓哪些 slug，不用靠英文名硬猜。
+CREATE TABLE IF NOT EXISTS overlay_catalog (
+    league       TEXT    NOT NULL,
+    category     TEXT    NOT NULL,
+    currency_id  TEXT    NOT NULL,
+    name         TEXT,
+    slug         TEXT,
+    PRIMARY KEY (league, category, currency_id)
+);
 CREATE TABLE IF NOT EXISTS spread (
     ts           INTEGER NOT NULL,
     league       TEXT    NOT NULL,
@@ -874,6 +911,165 @@ def source_intervals() -> dict[str, int]:
         "poe.ninja": NINJA_TTL_SECONDS,
         "poe2scout": SCOUT_TTL_SECONDS,
     }
+
+
+# ------------------------------------------------------- poeoverlay（第四数据源）
+#
+# ★ 它跟另外三个源不是一回事，别把它当成「换个网站抓同样的数」：
+#   doe / scout / ninja 每个通货只给**一个**价，value_chaos / value_exalted /
+#   value_divine 全是拿这一个价除汇率尺子折出来的 —— 同一轮里各通货的
+#   divine/exalted 比值恒定，所以在它们身上算「跨基准差价」必然是伪信号
+#   （v1.28.4 做过又删掉，就是栽在这里）。
+#   Overlay 直接读游戏内 Currency Exchange 的多组挂单，chaos / exalted /
+#   divine 三个市场各自独立报价，所以只有它能回答
+#   「买这个东西，付混沌石还是付崇高石更划算」。
+#
+# ★ 取数方式也完全不同：不需要浏览器。页面是 Next.js SSR，带 RSC:1 头
+#   直接 GET 详情页就能拿到 flight payload，里面有按 currencyId 分好的
+#   series（price + stock + timestamp，40 天日线），末点就是页面上的现价。
+#   单页 1.4s，纯标准库。详见 overlay.py 的文档串。
+OVERLAY_ENABLED = bool(CONFIG.get("overlay_enabled", True))
+OVERLAY_TTL = _clamp_int(CONFIG.get("overlay_ttl_seconds", 15 * 60),
+                         15 * 60, 5 * 60, 24 * 3600)
+
+
+def _overlay_categories() -> list[str]:
+    raw = CONFIG.get("overlay_categories")
+    if isinstance(raw, list):
+        out = [str(x).strip() for x in raw if str(x).strip()]
+        if out:
+            return out
+    return list(overlay_src.DEFAULT_CATEGORIES)
+
+
+OVERLAY_CATEGORIES = _overlay_categories()
+
+try:
+    OVERLAY_ARB_MAX_VOL = float(CONFIG.get("overlay_arb_max_vol", 1.5))
+except Exception:                                               # noqa: BLE001
+    OVERLAY_ARB_MAX_VOL = 1.5
+
+
+def overlay_league(league: str | None = None) -> str:
+    """本机联盟名 → Overlay URL 里的 slug：`Forbidden Rites` → `forbidden-rites`。
+
+    ★ 两边写法不一样：本库存的是带空格的正式名（"Forbidden Rites"），
+      Overlay 的 URL 用 kebab。直接拿 league 拼 URL 会得到 404。
+    """
+    return overlay_src.kebab(league or CONFIG.get("league") or "")
+
+
+_OVERLAY_LOCK = threading.Lock()
+_OVERLAY_STATE: dict = {"at": 0.0, "stats": None, "error": None, "league": ""}
+
+
+def overlay_round(league: str | None = None, force: bool = False) -> dict:
+    """抓一轮 poeoverlay 并落库。带 TTL 节流；失败只记日志，绝不影响本机抓取。"""
+    if not OVERLAY_ENABLED:
+        return {"ok": False, "reason": "overlay 已关闭"}
+    now = time.time()
+    with _OVERLAY_LOCK:
+        if (not force and _OVERLAY_STATE["at"]
+                and now - _OVERLAY_STATE["at"] < OVERLAY_TTL):
+            return {"ok": True, "cached": True, "stats": _OVERLAY_STATE["stats"]}
+        lg = overlay_league(league)
+        if not lg:
+            return {"ok": False, "reason": "没有联盟名，跳过"}
+        try:
+            result = overlay_src.fetch_round(
+                lg, OVERLAY_CATEGORIES, workers=4, log=log)
+        except Exception as exc:                                # noqa: BLE001
+            _OVERLAY_STATE["error"] = repr(exc)
+            log(f"  · overlay 抓取失败（不影响本机抓取）：{exc}")
+            return {"ok": False, "reason": repr(exc)}
+        try:
+            written = overlay_src.store(db(), lg, result, log=log)
+        except Exception as exc:                                # noqa: BLE001
+            _OVERLAY_STATE["error"] = repr(exc)
+            log(f"  · overlay 落库失败（不影响本机抓取）：{exc}")
+            return {"ok": False, "reason": repr(exc)}
+        _OVERLAY_STATE.update({"at": now, "stats": result["stats"],
+                               "error": None, "league": lg})
+        return {"ok": True, "written": written, "stats": result["stats"]}
+
+
+def overlay_prices(currency_id: str, league: str | None = None) -> dict:
+    """某通货在各基准上的 Overlay 实价：{base: {"value","stock","ts"}}。"""
+    try:
+        return overlay_src.latest_map(db(), overlay_league(league), currency_id)
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · overlay 读价失败：{exc}")
+        return {}
+
+
+def overlay_rates(league: str | None = None) -> dict:
+    """1 个基准货币值多少混沌石 —— 给详情页把三个基准的价折到同一把尺子用。
+
+    chaos 自己恒为 1；exalted / divine 取它们自己在 chaos 上的 Overlay 价。
+    """
+    try:
+        allp = overlay_src.latest_all(db(), overlay_league(league))
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · overlay 汇率读取失败：{exc}")
+        return {"chaos": 1.0}
+    out = {"chaos": 1.0}
+    for b in ("exalted", "divine"):
+        v = (allp.get(b, {}).get("chaos") or {}).get("value")
+        if v:
+            out[b] = v
+    return out
+
+
+def overlay_arb(max_vol=None, league: str | None = None) -> dict:
+    """跨基准差价榜。
+
+    ★ max_vol 的三态，别写混：
+        None → 用配置里的 overlay_arb_max_vol（默认行为）
+        <=0  → 彻底关掉可信度过滤，全列（前端「显示全部」走这条路）
+        >0   → 用这个数当门槛
+      直接把 None 当「不过滤」是错的：None 同时也是「没传参数」的意思，
+      结果就是勾了「显示全部」却仍然按默认门槛过滤（v1.31.0 踩过）。
+    """
+    lg = overlay_league(league)
+    if max_vol is None:
+        max_vol = OVERLAY_ARB_MAX_VOL
+    if max_vol is not None and max_vol <= 0:
+        max_vol = None
+    try:
+        rows = overlay_src.arb_board(db(), lg, max_vol=max_vol)
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · overlay 差价榜计算失败：{exc}")
+        rows = []
+    # 榜上要显示中文名，这里一次查齐，别让前端拿 id 去猜
+    names: dict[str, str] = {}
+    try:
+        for row in db().execute("SELECT currency_id, name_zh FROM item_meta"):
+            if row[1]:
+                names[row[0]] = row[1]
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · overlay 中文名读取失败：{exc}")
+    for row in rows:
+        row["name_zh"] = names.get(row["currency_id"]) or row["currency_id"]
+    return {"league": lg, "max_vol": max_vol,
+            "ready": bool(_OVERLAY_STATE["at"]), "rows": rows}
+
+
+class OverlayWorker(threading.Thread):
+    """定时抓 poeoverlay。跟本机抓取完全独立，挂了也不影响主流程。"""
+
+    def __init__(self, league: str, interval: int = OVERLAY_TTL) -> None:
+        super().__init__(name="overlay", daemon=True)
+        self.league = league
+        self.interval = interval
+
+    def run(self) -> None:
+        time.sleep(20)      # 等首轮本机抓取落地，别和启动流程抢资源
+        while True:
+            try:
+                overlay_round(self.league)
+            except Exception as exc:                            # noqa: BLE001
+                log(f"  · overlay 抓取异常：{exc}")
+            time.sleep(self.interval)
 
 # ★★ scout 数据的最大可采信年龄。
 #
@@ -7325,6 +7521,28 @@ class Handler(BaseHTTPRequestHandler):
                         args.get("source", [""])[0],
                     )
                 )
+            elif path == "/api/overlay":
+                # 某个通货在 poeoverlay 上各基准的实价（v1.31.0）。
+                # 详情页拿它显示「付混沌石 / 崇高石 / 神圣石分别是多少钱」——
+                # 这三个数是三个独立挂单市场给的，不是同一个价折出来的。
+                self._json({"id": args.get("id", [""])[0],
+                            "bases": overlay_prices(args.get("id", [""])[0]),
+                            "rates": overlay_rates()})
+            elif path == "/api/overlay/arb":
+                # 跨基准差价榜。all=1 表示不看可信度、全列（调试用）。
+                # 0 表示「关掉过滤」。★ 不能传 None —— 那在 overlay_arb 里
+                # 是「没传参数、用配置默认值」的意思，勾了「显示全部」却还在过滤。
+                max_vol = 0 if args.get("all", [""])[0] in ("1", "true", "yes") else None
+                if max_vol is None:
+                    raw = args.get("max_vol", [""])[0]
+                    try:
+                        max_vol = float(raw) if raw else OVERLAY_ARB_MAX_VOL
+                    except Exception:                           # noqa: BLE001
+                        max_vol = OVERLAY_ARB_MAX_VOL
+                self._json(overlay_arb(max_vol=max_vol))
+            elif path == "/api/overlay/refresh":
+                # 手动立刻抓一轮（绕过 TTL）。抓不到会返回 reason。
+                self._json(overlay_round(force=True))
             elif path == "/api/sparks":
                 # 倒货榜每行那个小曲线的批量接口（v1.28.3）。
                 # 参数与 /api/history 对齐，小图和大图才不会各说各话。
@@ -7828,6 +8046,13 @@ def main() -> None:
     # 云端那头实测只有 ~23% 的跑成率，这个兜底保证「离线回来一定补得到东西」。
     if SCOUT_BACKFILL:
         ScoutBackfillWorker(str(STATE.get("league") or CONFIG.get("league") or "")).start()
+
+    # poeoverlay（第四数据源）：只负责多基准实价与跨基准差价，
+    # 不参与本机取价主流程，所以它挂了对其它源没有任何影响。
+    if OVERLAY_ENABLED:
+        OverlayWorker(str(STATE.get("league") or CONFIG.get("league") or "")).start()
+        log(f"poeoverlay 已启用（每 {OVERLAY_TTL // 60} 分钟一轮，"
+            f"分类 {len(OVERLAY_CATEGORIES)} 个：{', '.join(OVERLAY_CATEGORIES)}）")
 
     # 各源数据预热：把三个源的价 + 曲线历史都提前缓存好，
     # 切换数据源（详情曲线 / 取价主源）时直接读缓存，不用现等一次网络请求。
