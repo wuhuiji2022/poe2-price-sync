@@ -57,12 +57,21 @@ DEFAULT_CATEGORIES = ["currency", "essences", "ritual", "breach", "fragments"]
 # Overlay 提供的计价基准。用户要的三个都在里面，annul 是白送的。
 BASES = ("divine", "chaos", "exalted", "annul")
 
-# ★ 但参与「跨基准差价」计算的只有这三个，annul 不参与。
-#   原因（2026-10-14 实测）：annul 是个流动性很差的配对，报价经常离谱 ——
-#   transmute 在 annul 上的挂出量直接是 0，greater-orb-of-augmentation 折出来
-#   0.474 而 chaos/exalted 两路只有 0.03~0.06。把它算进来会把 vaal 的差价
-#   从 2.7% 抬到 21.4%，整张榜被一个没人用的市场带偏。
-ARB_BASES = ("divine", "chaos", "exalted")
+# ★ 参与「跨基准差价」计算的基准。annul 和 exalted 都不在里面：
+#
+#   annul（v1.31.0 剔除）：流动性很差的配对，报价经常离谱 —— transmute 在
+#     annul 上的挂出量直接是 0，greater-orb-of-augmentation 折出来 0.474
+#     而 chaos 路只有 0.054。会把 vaal 的差价从 2.7% 抬到 21.4%。
+#
+#   exalted（v1.32.0 剔除）：★★ 它的报价水平系统性偏低，不是市场价差。
+#     拿三源（doe / poe.ninja）的现价当公允价对照 191 个通货：
+#       · exalted 侧 ÷ chaos 侧 中位数只有 0.473，92% 的通货偏离超 ±20%
+#       · 连最贵的货也偏：omen -63%、annul -27%、vaal +20%
+#       · 不是停更造成的 —— 四个基准最新点中位龄都是 25.5h，exalted 更旧的
+#         只有 4/191。是价格水平本身的口径问题。
+#     结果就是榜上清一色「用崇高石买 → 卖成神圣石，赚 150%~7000%」的伪信号。
+#     对照下来 chaos 侧和 divine 侧跟三源吻合（贵的货差 1%~6%），所以只留这两条路。
+ARB_BASES = ("divine", "chaos")
 
 # 日线桶会持续修订（今天那一格在 UTC 日切前一直在变），
 # 所以每轮把「已存的最大 ts」那一格重写一遍，而不是只写严格更新的点。
@@ -329,6 +338,20 @@ def latest_all(con: sqlite3.Connection, league: str) -> dict[str, dict[str, dict
     return out
 
 
+def categories(con: sqlite3.Connection, league: str) -> dict[str, str]:
+    """通货 id → 分类（currency / essences / ritual / breach / fragments）。
+
+    ★ 一件通货理论上只属于一个分类，但抓目录时可能重复落库，这里取一个就够。
+      查不到就返回空串，前端归到「其它」。
+    """
+    try:
+        return {r[0]: r[1] for r in con.execute(
+            "SELECT currency_id, MIN(category) FROM overlay_catalog "
+            "WHERE league=? GROUP BY currency_id", (league,))}
+    except Exception:                                           # noqa: BLE001
+        return {}
+
+
 def series(con: sqlite3.Connection, league: str, cid: str,
            base: str) -> list[tuple[int, float]]:
     """某通货在某基准上的完整日线 [(ts, value)]，升序。"""
@@ -340,7 +363,7 @@ def series(con: sqlite3.Connection, league: str, cid: str,
 
 
 def vol(con: sqlite3.Connection, league: str, cid: str, days: int = 7,
-        a: str = "exalted", b: str = "chaos"):
+        a: str = "divine", b: str = "chaos"):
     """「这个通货的各基准报价互相打架吗」——可信度。返回 None 表示算不出来。
 
     ★ 为什么必须有它（2026-10-14 实测）：
@@ -350,6 +373,11 @@ def vol(con: sqlite3.Connection, league: str, cid: str, days: int = 7,
       乱跳（波动近 3 倍），是薄市场的噪音，不是能吃的价差。
       反过来 divine / vaal 反推出来的汇率天天贴着市场值（波动 1.04 / 1.21），
       它们的差价才可信。所以榜单必须按这个波动过滤，否则满屏都是垃圾数字。
+
+    ★★ 默认基准对改成 (divine, chaos)（v1.32.0）：exalted 退出差价计算后，
+      这一对必须跟着换 —— 否则会出现「exalted/chaos 很稳、但 divine/chaos
+      天天乱跳」的通货照样过闸门，而榜上用的恰恰是后者。可信度判据测的
+      必须就是榜单用的那一对。
 
     算法：用该通货自己的 (a 价 ÷ b 价) 反推「1 个 b 值多少 a」，
     再跟市场汇率（b 自己的 a 价）比，取最近 days 天这个比值的 max/min。
@@ -374,19 +402,25 @@ def vol(con: sqlite3.Connection, league: str, cid: str, days: int = 7,
 
 
 def arb_board(con: sqlite3.Connection, league: str, max_vol=None,
-              ref: str = "chaos") -> list[dict]:
+              ref: str = "chaos", fair: dict[str, float] | None = None,
+              tol: float = 0.25) -> list[dict]:
     """整张跨基准差价榜，按差价降序。
 
     max_vol=None 不过滤；给个数值（如 1.5）就只保留波动没超过它的。
+    fair={cid: 公允价} + tol=容忍度 → 开公允价闸门（见 arb_row 的说明）。
     ★ 算不出波动的非基准通货一律不要（实测 mirror 就是这样混进榜首的：
-      它只有 chaos / divine 两条序列，两条互相差 2190%，没有第三条就没法证伪）。
+      它 chaos / divine 两条互相差 2190%，连自证的机会都没有）。
       基准货币自己（divine / chaos / exalted / annul）例外 —— 它们缺的那条序列
       是「自己兑自己」，恒等于 1，本来就不用给。
+
+    ★ v1.32.0：榜只剩 chaos / divine 两条路（exalted 侧报价系统性偏低，已剔除），
+      所以「buy = 用哪种货币买」「sell = 卖成哪种货币」只可能在这两者之间产生。
     """
     prices = latest_all(con, league)
     rows: list[dict] = []
     for cid in prices:
-        row = arb_row(prices, cid, ref=ref)
+        row = arb_row(prices, cid, ref=ref,
+                      fair=(fair or {}).get(cid), tol=tol)
         if not row:
             continue
         v = vol(con, league, cid)
@@ -402,17 +436,35 @@ def arb_board(con: sqlite3.Connection, league: str, max_vol=None,
 
 
 def arb_row(prices: dict[str, dict[str, dict]], cid: str,
-            ref: str = "chaos"):
+            ref: str = "chaos", fair: float | None = None,
+            tol: float = 0.25):
     """算一个通货的跨基准差价，全部折算到 ref 尺子。
 
     prices = latest_all() 的结果。
     返回 {"via": {base: 折算价}, "best": base, "worst": base, "spread": 比值-1}
+
+    ★ 买卖语义（v1.32.0）：光说「差价 12%」没人看得懂，得说清「拿什么去买、
+      卖成什么收钱」。参与比较的几个基准是各自报价的挂单市场，同一件通货在
+      它们上面的折算价不一样 —— 折算价最低的那条路 = 用它买最便宜 = **用什么买**；
+      折算价最高的那条路 = 卖成它能收最多 = **卖成什么**。
+      所以 buy = best（min），sell = worst（max），别写反。
+
+    ★★ 公允价闸门（v1.32.0）：fair 给一个「这个通货到底值多少 ref」的参照
+      （本机用的是 doe / poe.ninja 的现价），tol 是容忍度（0.25 = ±25%）。
+      某条路折出来跟公允价差太多 → 判它报价不可信，不许参与买卖。
+      为什么非加不可：波动门槛（vol）测的是「稳不稳」，可一个**恒定的错误报价
+      恰恰最稳定**，vol 恒等于 1.0，永远过闸门。实测镜石的混沌侧只报出真价的
+      0.04×、几率碎片的神圣侧报出 140×，两者波动都只有 1.0x~1.4x，
+      全靠这道闸门挡掉。
+      两侧都不够可信 → 返回 None（连一行都不该给）。
 
     ★ 换算：X 用基准 b 计价是 R[X][b]，而 1 个 b 值 R[b][ref] 个 ref，
       所以 X 折算到 ref = R[X][b] × R[b][ref]，其中 R[ref][ref] = 1。
     """
     own = prices.get(cid) or {}
     via: dict[str, float] = {}
+    raw: dict[str, float] = {}       # 每个基准自己的原始报价（没折过）
+    stk: dict[str, float] = {}
     for b in ARB_BASES:
         if b == ref:
             continue
@@ -424,20 +476,51 @@ def arb_row(prices: dict[str, dict[str, dict]], cid: str,
         if not rb:
             continue
         via[b] = px["value"] * rb
-    # 直接用 ref 自己计价的那一路
+        raw[b] = px["value"]
+        if px.get("stock"):
+            stk[b] = px["stock"]
+    # 直接用 ref 自己计价的那一路：它已经是 ref 尺子，不用折
     if cid == ref:
         via[ref] = 1.0
+        raw[ref] = 1.0
     elif own.get(ref, {}).get("value"):
         via[ref] = own[ref]["value"]
+        raw[ref] = own[ref]["value"]
+        if own[ref].get("stock"):
+            stk[ref] = own[ref]["stock"]
     if len(via) < 2:
         return None
-    best = min(via, key=lambda k: via[k])
-    worst = max(via, key=lambda k: via[k])
-    lo, hi = via[best], via[worst]
+    # —— 公允价闸门：偏离太大的那条路直接不许参与买卖 ——
+    # ★ 别拿它去改 via 本身：via 是「观测到的原始报价」，前端还要看；
+    #   这里只是决定**哪条路能拿来算买卖**。
+    credible: dict[str, bool] = {}
+    if fair and fair > 0 and tol and tol > 0:
+        credible = {b: abs(v / fair - 1.0) <= tol for b, v in via.items()}
+        pool = {b: v for b, v in via.items() if credible[b]}
+    else:
+        credible = {b: True for b in via}
+        pool = via
+    if len(pool) < 2:
+        return None
+    best = min(pool, key=lambda k: pool[k])
+    worst = max(pool, key=lambda k: pool[k])
+    lo, hi = pool[best], pool[worst]
     if lo <= 0:
         return None
     return {"via": via, "best": best, "worst": worst,
-            "spread": hi / lo - 1.0}
+            "spread": hi / lo - 1.0,
+            # —— 买卖语义（v1.32.0）——
+            "buy": best,            # 用什么买：可信路里折算价最低的那条
+            "sell": worst,          # 卖成什么：可信路里折算价最高的那条
+            # 原始报价：买 1 个要付多少 buy / 卖 1 个能收多少 sell
+            "buy_price": raw.get(best),
+            "sell_price": raw.get(worst),
+            # 折到 ref 尺子的成本 / 收入 / 净赚，前端显示这三个
+            "buy_eq": lo, "sell_eq": hi, "profit": hi - lo,
+            # 挂出量：能吃多少全看它，差价再大没人挂单也是白搭
+            "buy_stock": stk.get(best),
+            "sell_stock": stk.get(worst),
+            "ref": ref, "fair": fair, "credible": credible}
 
 
 if __name__ == "__main__":
