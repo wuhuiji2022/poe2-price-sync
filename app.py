@@ -49,7 +49,7 @@ from zhdict import ZH
 import overlay as overlay_src
 
 APP_NAME = "poe2-currency-tracker"
-VERSION = "1.31.0"
+VERSION = "1.32.0"
 USER_AGENT = f"{APP_NAME}/{VERSION} (personal local tool)"
 
 NINJA_API = "https://poe.ninja/poe2/api/economy"
@@ -949,6 +949,13 @@ try:
 except Exception:                                               # noqa: BLE001
     OVERLAY_ARB_MAX_VOL = 1.5
 
+# 公允价闸门（v1.32.0）：overlay 每条路的折价跟「三源现价」差多少就不许参与买卖。
+# 0.25 = ±25%。★ <=0 表示关掉这道闸门（前端「全部」会走这条路）。
+try:
+    OVERLAY_ARB_FAIR_TOL = float(CONFIG.get("overlay_arb_fair_tol", 0.25))
+except Exception:                                               # noqa: BLE001
+    OVERLAY_ARB_FAIR_TOL = 0.25
+
 
 def overlay_league(league: str | None = None) -> str:
     """本机联盟名 → Overlay URL 里的 slug：`Forbidden Rites` → `forbidden-rites`。
@@ -1035,8 +1042,25 @@ def overlay_arb(max_vol=None, league: str | None = None) -> dict:
         max_vol = OVERLAY_ARB_MAX_VOL
     if max_vol is not None and max_vol <= 0:
         max_vol = None
+    # ★ 公允价闸门跟波动闸门共用一个「关不关」的开关：max_vol 被翻成 None
+    #   就表示用户要看全部，此时连公允价校验一起关掉。
+    tol = OVERLAY_ARB_FAIR_TOL if max_vol is not None else 0.0
+    fair: dict[str, float] = {}
+    if tol > 0:
+        try:
+            # doe / poe.ninja 的现价（scout 停更时它那份就没有，取最新的那一轮）
+            for cid, vc in db().execute(
+                    "SELECT s.currency_id, s.value_chaos FROM snapshot s "
+                    "WHERE s.ts=(SELECT MAX(t.ts) FROM snapshot t "
+                    "             WHERE t.currency_id=s.currency_id)"):
+                if vc and vc > 0:
+                    fair[cid] = vc
+        except Exception as exc:                                # noqa: BLE001
+            log(f"  · overlay 公允价读取失败（闸门本轮失效）：{exc}")
+            fair = {}
     try:
-        rows = overlay_src.arb_board(db(), lg, max_vol=max_vol)
+        rows = overlay_src.arb_board(db(), lg, max_vol=max_vol,
+                                     fair=fair, tol=tol)
     except Exception as exc:                                    # noqa: BLE001
         log(f"  · overlay 差价榜计算失败：{exc}")
         rows = []
@@ -1048,9 +1072,20 @@ def overlay_arb(max_vol=None, league: str | None = None) -> dict:
                 names[row[0]] = row[1]
     except Exception as exc:                                    # noqa: BLE001
         log(f"  · overlay 中文名读取失败：{exc}")
+    # 分类给前端做筛选（v1.32.0）。查不到就留空，前端归到「其它」。
+    cats: dict[str, str] = {}
+    try:
+        cats = overlay_src.categories(db(), lg)
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  · overlay 分类读取失败：{exc}")
     for row in rows:
         row["name_zh"] = names.get(row["currency_id"]) or row["currency_id"]
+        row["category"] = cats.get(row["currency_id"]) or ""
     return {"league": lg, "max_vol": max_vol,
+            # ★ 关掉过滤时 max_vol 是 None，前端还要拿默认门槛当筛选项的默认值，
+            #   所以另给一个恒为配置值的字段。
+            "vol_default": OVERLAY_ARB_MAX_VOL,
+            "fair_tol": tol, "fair_n": len(fair),
             "ready": bool(_OVERLAY_STATE["at"]), "rows": rows}
 
 
